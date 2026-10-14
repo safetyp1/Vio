@@ -184,20 +184,23 @@ not list cards or whole seasons/series, and reuses a recent discovery for 30
 seconds. Native clients and Jellyfin clients keep their existing playback-time
 behavior when the setting is off.
 
-When enabled, `GET /api/v2/catalog/items/{id}` and `GET /api/v2/watch/{id}` also
-discover versions after checking access for a virtual movie or individual
-episode. They use the same cached discovery service and re-read detail before
-answering, so existing native clients receive the persisted versions without calling the
+When enabled, `GET /api/v2/watch/{id}` also discovers versions after checking
+access for a virtual movie or individual episode. It uses the same cached
+discovery service and re-reads watch detail before answering, so existing
+native clients receive the persisted versions without calling the
 discovery operation themselves. Discovery has a 15-second waiting budget.
 On failure, the original detail is returned; shared provider work may finish
 after that wait and be visible on a later request.
-Local-file details, browse results, and season/series lists do not trigger it.
-Client-side detail prefetches can trigger discovery; a view served entirely
+Catalog item detail reads never initiate pre-play discovery: artwork and
+metadata can render before the web's discovery call or the native client's
+watch-detail enrichment finishes. Local-file details, browse results, and
+season/series lists do not trigger it.
+Client-side watch-detail prefetches can trigger discovery; a view served entirely
 from the client's cache cannot. This does not add a Jellyfin-protocol trigger.
 
 Server logs identify this path with `pre-play version discovery started`,
 `pre-play version discovery completed`, or `pre-play version discovery unavailable`
-and `trigger=catalog_detail` or `trigger=watch_detail`. A successful discovery
+and `trigger=watch_detail`. A successful discovery
 followed by a failed detail re-read logs `pre-play version discovery detail reload failed`.
 
 ### Refresh List

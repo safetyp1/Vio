@@ -336,6 +336,11 @@ func TestDetailPreplayDiscovery(t *testing.T) {
 			{name: "reload failure", mediaType: "movie", path: "virtual://movie/tt0113277", reloadErr: errors.New("reload failed"), wantCalls: 1, wantReads: 2, wantFileID: "120"},
 			{name: "denied", mediaType: "movie", path: "virtual://movie/tt0113277", denied: true, wantReads: 1},
 		} {
+			if endpoint == "catalog/items" {
+				test.wantCalls = 0
+				test.wantReads = 1
+				test.wantFileID = "120"
+			}
 			t.Run(endpoint+"/"+test.name, func(t *testing.T) {
 				deps, base := catalogDeps(t)
 				fake := &fakePreplayCatalog{

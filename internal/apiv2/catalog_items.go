@@ -1198,14 +1198,6 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	if detail != nil && reg.discoverDetailVersions(ctx, in.ID, detail.Type, detail.Versions, viewer.Access, "catalog_detail") {
-		refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
-		if refreshErr == nil && refreshed != nil {
-			detail = refreshed
-		} else {
-			slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "catalog_detail")
-		}
-	}
 	out := catalogItemDetailOf(detail, reg.ratingSelection(ctx))
 	out.Collections = NonNil(reg.itemCollections(ctx, detail, viewer.Access))
 	if reg.deps.ThemeSongs != nil && (detail.Type == themeOwnerMovie || detail.Type == themeOwnerSeries || detail.Type == themeOwnerSeason || detail.Type == themeOwnerEpisode) {
