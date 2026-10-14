@@ -64,7 +64,13 @@ describe("ActionBar", () => {
     discoveryMocks.discover.mockReset();
   });
 
-  it.each(["virtual://movie/tt123", "virtual://series/tt123:1:2"])(
+  it.each([
+    "virtual://movie/tt123",
+    "virtual://series/tt123:1:2",
+    "virtual://series/tt123/1/2",
+    "virtual://series/tvdb/393159/3/1",
+    "virtual://series/tmdb/202555/1/2?profile=1080p",
+  ])(
     "discovers %s before Play and refreshes the version queries",
     async (filePath) => {
       discoveryMocks.capability.mockResolvedValue({ discover_before_playback: true });
@@ -98,7 +104,13 @@ describe("ActionBar", () => {
     expect(screen.queryByText("Finding versions")).not.toBeInTheDocument();
   });
 
-  it.each(["/media/movie.mkv", "virtual://series/tt123"])("does not discover %s", (filePath) => {
+  it.each([
+    "/media/movie.mkv",
+    "virtual://series/tt123",
+    "virtual://series/tt123/1",
+    "virtual://series/tvdb/393159",
+    "virtual://series/tmdb/202555",
+  ])("does not discover %s", (filePath) => {
     const version = { ...selectedVersion, file_path: filePath };
     renderActionBar({ contentId: "media-1", versions: [version], selectedVersion: version });
     expect(discoveryMocks.capability).not.toHaveBeenCalled();

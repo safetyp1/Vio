@@ -351,7 +351,9 @@ export default function ActionBar({
   const deleteMediaItem = useDeleteMediaItem();
   const queryClient = useQueryClient();
   const virtualDetail = !!versions?.some((version) =>
-    /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+:\d+:\d+)(?:\?|$)/.test(version.file_path ?? ""),
+    /^virtual:\/\/(?:movie\/[^?]+|series\/[^?]+(?::\d+:\d+|\/\d+\/\d+))(?:\?|$)/.test(
+      version.file_path ?? "",
+    ),
   );
   const { discovering, failed: discoveryFailed } = usePreplayDiscovery(contentId, virtualDetail);
   const { awaitAdminJob } = useRealtimeEvents();
