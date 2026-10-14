@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	opDiscoverVirtualCandidates      = "discoverVirtualCandidates"
 	opRefreshVirtualCandidates       = "refreshVirtualCandidates"
 	opCancelVirtualCandidatesRefresh = "cancelVirtualCandidatesRefresh"
 	opRequestVirtualRelease          = "requestVirtualRelease"
@@ -23,6 +24,10 @@ const (
 type VirtualCandidatesRefreshService interface {
 	CreateRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
 	CancelRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
+}
+
+type VirtualCandidatesDiscoveryService interface {
+	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the
@@ -56,6 +61,17 @@ type VirtualReleaseRequestOutput struct {
 }
 
 func registerMediaCandidates(reg *Registry) {
+	discover := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:discover", opDiscoverVirtualCandidates, "watch",
+		"Discover and persist cached provider versions before playback when enabled, without probing or requesting releases.")
+	discover.DefaultStatus = http.StatusNoContent
+	Register(reg, Operation{
+		Operation:       discover,
+		Class:           ClassProfileScoped,
+		ProfileOptional: true,
+		ServiceBacked:   true,
+		RetrySafety:     RetrySafetyCoalescing,
+	}, reg.discoverVirtualCandidates)
+
 	op := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:refresh", opRefreshVirtualCandidates, "watch",
 		"Queue an asynchronous provider re-list of a virtual item's version candidates and answer the job to wait on.")
 	op.DefaultStatus = http.StatusAccepted
@@ -97,6 +113,25 @@ func registerMediaCandidates(reg *Registry) {
 		// enqueue.
 		RetrySafety: RetrySafetyDomainIdentity,
 	}, reg.requestVirtualRelease)
+}
+
+func (reg *Registry) discoverVirtualCandidates(ctx context.Context, in *VirtualCandidatesRefreshInput) (*struct{}, error) {
+	claims := claimsFrom(ctx)
+	if claims == nil {
+		return nil, NewProblem(TypeAuthenticationRequired, "Authentication is required.")
+	}
+	if reg.deps.VirtualCandidatesDiscovery == nil || reg.deps.Watch == nil ||
+		reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
+		return nil, unavailable("pre-play version discovery")
+	}
+	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
+	if err != nil {
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+	}
+	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter); err != nil {
+		return nil, serviceProblem(err)
+	}
+	return &struct{}{}, nil
 }
 
 func (reg *Registry) refreshVirtualCandidates(ctx context.Context, in *VirtualCandidatesRefreshInput) (*AdminCatalogJobAcceptedOutput, error) {
