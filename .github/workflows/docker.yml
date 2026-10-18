@@ -26,7 +26,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  SOURCE_REVISION: e9e9f538bd9659c991dcee4e5e9de63d1c47fe1a
+  SOURCE_REVISION: a19da085fde52c2999b06d08e5cd77ed69445991
   # Published build numbers belong to this workflow. Keep it as the sole owner
   # of the sequence; raise the offset if the workflow counter ever loses
   # continuity so a new build remains greater than every existing build tag.
