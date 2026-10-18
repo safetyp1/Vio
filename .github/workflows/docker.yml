@@ -26,6 +26,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  SOURCE_REVISION: 8a90261082af7d73d9652a937105ac1bc89e4dd3
   # Published build numbers belong to this workflow. Keep it as the sole owner
   # of the sequence; raise the offset if the workflow counter ever loses
   # continuity so a new build remains greater than every existing build tag.
@@ -63,7 +64,7 @@ jobs:
           fi
 
           build_number=""
-          image_version="${GITHUB_SHA::7}"
+          image_version="${SOURCE_REVISION::7}"
           is_stable="false"
           if [[ "$EVENT_NAME" == "release" ]]; then
             if (( ${#RELEASE_TAG} > 128 )); then
@@ -99,7 +100,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ env.SOURCE_REVISION }}
 
       - name: Set up pnpm for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
@@ -148,7 +149,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ env.SOURCE_REVISION }}
 
       - name: Prepare platform slug and lowercase image name
         run: |
@@ -214,7 +215,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT }}
+          password: ${{ github.token }}
 
       - name: Extract metadata
         id: meta
@@ -223,7 +224,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.created=${{ needs.prepare.outputs.built_at }}
-            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
+            org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.image_version }}
 
       - name: Build and push by digest
@@ -240,7 +241,7 @@ jobs:
           build-contexts: |
             frontend_dist=./web/dist
           build-args: |
-            BUILD_REVISION=${{ github.event.workflow_run.head_sha || github.sha }}
+            BUILD_REVISION=${{ env.SOURCE_REVISION }}
             BUILD_DIRTY=false
             BUILD_NUMBER=${{ needs.prepare.outputs.build_number }}
             BUILD_DATE=${{ needs.prepare.outputs.built_at }}
@@ -287,7 +288,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT }}
+          password: ${{ github.token }}
 
       - name: Extract metadata
         id: meta
@@ -300,7 +301,7 @@ jobs:
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
             type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
             type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
-            type=raw,value=${{ (github.event.workflow_run.head_sha || github.sha) }}
+            type=raw,value=${{ env.SOURCE_REVISION }}
 
       - name: Create and push manifest list
         working-directory: ${{ runner.temp }}/digests
@@ -319,7 +320,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IS_STABLE: ${{ needs.prepare.outputs.is_stable }}
         run: |
-          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ env.SOURCE_REVISION }}"
           if [[ -n "${BUILD_NUMBER}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
           fi
