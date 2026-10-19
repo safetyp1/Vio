@@ -26,7 +26,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  SOURCE_REVISION: c6214aff9adf6a990bf126dd8ab0a6af5638b9b6
+  SOURCE_REVISION: 5144c548f15bd711441553e1bd50a3b0c3f457ff
   # Published build numbers belong to this workflow. Keep it as the sole owner
   # of the sequence; raise the offset if the workflow counter ever loses
   # continuity so a new build remains greater than every existing build tag.
@@ -296,7 +296,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
-            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
+            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && (github.ref_name == github.event.repository.default_branch || github.ref_name == 'build/pr-333-image'))) }}
             type=raw,value=latest,enable=${{ needs.prepare.outputs.is_stable == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
             type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
@@ -324,7 +324,7 @@ jobs:
           if [[ -n "${BUILD_NUMBER}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
           fi
-          if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
+          if [[ "${EVENT_NAME}" != "release" && ( "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" || "${TARGET_BRANCH}" == "build/pr-333-image" ) ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
           fi
           if [[ "${IS_STABLE}" == "true" || "${PUBLISH_LATEST}" == "true" ]]; then
