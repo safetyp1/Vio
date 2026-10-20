@@ -3,8 +3,10 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
@@ -12,6 +14,7 @@ import (
 )
 
 const (
+	opDiscoverVirtualCandidates      = "discoverVirtualCandidates"
 	opRefreshVirtualCandidates       = "refreshVirtualCandidates"
 	opCancelVirtualCandidatesRefresh = "cancelVirtualCandidatesRefresh"
 	opRequestVirtualRelease          = "requestVirtualRelease"
@@ -23,6 +26,85 @@ const (
 type VirtualCandidatesRefreshService interface {
 	CreateRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
 	CancelRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
+}
+
+type VirtualCandidatesDiscoveryService interface {
+	DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error)
+	HasVirtualSource(ctx context.Context, contentID string) (bool, error)
+}
+
+const (
+	// preplayDiscoveryWatchBudget bounds version discovery started from
+	// GET /watch/{id}: the caller is preparing to play, so a cold provider
+	// scrape may be waited out before the answer.
+	preplayDiscoveryWatchBudget = 15 * time.Second
+	// preplayDiscoveryCatalogBudget bounds the same discovery started from a
+	// catalog leaf detail read: browsing is the hot path (Android opens item
+	// detail before any watch request), so the answer keeps a short budget
+	// while the discovery service keeps working detached from it.
+	//
+	// Three seconds, not two: cold provider scrapes run anywhere from tens of
+	// milliseconds to about 2.5s, and the original two-second budget cut the
+	// longest of them off after the wall-clock overhead around the scrape.
+	// Android has no refetch of its own, so a budget loss is a lost
+	// first-open answer, not a delayed one. Deployments tune it with the
+	// admin Streaming setting virtual_library.catalog_discovery_budget_ms.
+	preplayDiscoveryCatalogBudget = 3 * time.Second
+)
+
+// preplayDiscoveryCatalogBudgetFor resolves the catalog leaf detail budget:
+// the configured setting when wired, otherwise the built-in default. A
+// non-positive answer (unset reader, unreadable setting) falls back to the
+// default rather than stretching the wait.
+func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.Duration {
+	if reg.deps.PreplayDiscoveryBudgetMs == nil {
+		return preplayDiscoveryCatalogBudget
+	}
+	if ms := reg.deps.PreplayDiscoveryBudgetMs(ctx); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return preplayDiscoveryCatalogBudget
+}
+
+func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
+	claims := claimsFrom(ctx)
+	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
+		reg.deps.VirtualCandidatesDiscovery == nil {
+		return false, false
+	}
+	// Eligibility reads the stored rows server-side instead of the caller's
+	// (possibly path-redacted) version list, so ordinary viewers reach the
+	// same discovery the watch path performs. It also feeds the detail
+	// response's has_virtual_source hint, so it runs regardless of whether
+	// discovery is enabled.
+	virtual, err := reg.deps.VirtualCandidatesDiscovery.HasVirtualSource(ctx, contentID)
+	if err != nil {
+		slog.WarnContext(ctx, "pre-play version discovery skipped", "component", "apiv2", "item_id", contentID,
+			"trigger", trigger, "reason", "eligibility_lookup_failed", "error", err)
+		return false, false
+	}
+	hasVirtualSource = virtual
+	if !virtual {
+		return false, false
+	}
+	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
+		return false, hasVirtualSource
+	}
+	started := time.Now()
+	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	slog.InfoContext(ctx, "pre-play version discovery started", "component", "apiv2", "item_id", contentID, "trigger", trigger)
+	listed, listErr := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(
+		discoveryCtx, claims.UserID, profileFrom(ctx), contentID, filter,
+	)
+	if listErr != nil {
+		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
+			"trigger", trigger, "duration_ms", time.Since(started).Milliseconds())
+		return false, true
+	}
+	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
+		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
+	return true, true
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the
@@ -56,6 +138,17 @@ type VirtualReleaseRequestOutput struct {
 }
 
 func registerMediaCandidates(reg *Registry) {
+	discover := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:discover", opDiscoverVirtualCandidates, "watch",
+		"Discover and persist cached provider versions before playback when enabled, without probing or requesting releases.")
+	discover.DefaultStatus = http.StatusNoContent
+	Register(reg, Operation{
+		Operation:       discover,
+		Class:           ClassProfileScoped,
+		ProfileOptional: true,
+		ServiceBacked:   true,
+		RetrySafety:     RetrySafetyCoalescing,
+	}, reg.discoverVirtualCandidates)
+
 	op := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:refresh", opRefreshVirtualCandidates, "watch",
 		"Queue an asynchronous provider re-list of a virtual item's version candidates and answer the job to wait on.")
 	op.DefaultStatus = http.StatusAccepted
@@ -97,6 +190,25 @@ func registerMediaCandidates(reg *Registry) {
 		// enqueue.
 		RetrySafety: RetrySafetyDomainIdentity,
 	}, reg.requestVirtualRelease)
+}
+
+func (reg *Registry) discoverVirtualCandidates(ctx context.Context, in *VirtualCandidatesRefreshInput) (*struct{}, error) {
+	claims := claimsFrom(ctx)
+	if claims == nil {
+		return nil, NewProblem(TypeAuthenticationRequired, "Authentication is required.")
+	}
+	if reg.deps.VirtualCandidatesDiscovery == nil || reg.deps.Watch == nil ||
+		reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
+		return nil, unavailable("pre-play version discovery")
+	}
+	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
+	if err != nil {
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+	}
+	if _, err := reg.deps.VirtualCandidatesDiscovery.DiscoverVirtualCandidates(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter); err != nil {
+		return nil, serviceProblem(err)
+	}
+	return &struct{}{}, nil
 }
 
 func (reg *Registry) refreshVirtualCandidates(ctx context.Context, in *VirtualCandidatesRefreshInput) (*AdminCatalogJobAcceptedOutput, error) {

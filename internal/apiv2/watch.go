@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -60,6 +61,13 @@ type WatchDetail struct {
 	EffectiveVersionHDR             *bool                   `json:"effective_version_hdr,omitempty"`
 	EffectiveVersionCodecVideo      *string                 `json:"effective_version_codec_video,omitempty"`
 	EffectiveVersionEditionKey      *string                 `json:"effective_version_edition_key,omitempty"`
+	// HasVirtualSource renders only when the item carries persisted virtual
+	// candidate groups; the value is always true. The read comes from the
+	// same stored rows discovery uses and is independent of whether discovery
+	// is enabled. Absent for non-leaf items, items without virtual
+	// candidates, and failed lookups. It does not promise additional playable
+	// versions beyond what the versions fields list.
+	HasVirtualSource *bool `json:"has_virtual_source,omitempty"`
 }
 
 // WatchFileVersion is one playable file of the item.
@@ -76,6 +84,7 @@ type WatchFileVersion struct {
 	DurationSeconds          int                  `json:"duration_seconds" example:"10200"`
 	Bitrate                  int                  `json:"bitrate" doc:"Bits per second"`
 	FormatScore              *int                 `json:"format_score,omitempty" doc:"Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)"`
+	MatchedFormats           []string             `json:"matched_formats,omitempty" doc:"Names of the enabled, non-rejecting custom formats the ranking matched on this candidate, best score first, then name; absent when the row is unscored or matched none"`
 	AddedAt                  Instant              `json:"added_at" example:"2026-01-02T03:04:05.000Z"`
 	EditionRaw               string               `json:"edition_raw,omitempty"`
 	EditionKey               string               `json:"edition_key,omitempty"`
@@ -363,7 +372,28 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	if err != nil {
 		return nil, watchDetailProblem(err)
 	}
+	// The eligibility read that discovery performs also feeds
+	// has_virtual_source, independent of whether discovery is enabled or its
+	// budget expired: a leaf answer names whether the item carries persisted
+	// virtual candidates even when nothing new is discovered this read.
+	var virtualSource *bool
+	if detail != nil {
+		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget)
+		if hasVirtualSource {
+			source := hasVirtualSource
+			virtualSource = &source
+		}
+		if discovered {
+			refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
+			if refreshErr == nil && refreshed != nil {
+				detail = refreshed
+			} else {
+				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
+			}
+		}
+	}
 	body := watchDetailOf(detail)
+	body.HasVirtualSource = virtualSource
 	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
 	return &WatchDetailOutput{Body: body}, nil
 }
@@ -502,6 +532,7 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		DurationSeconds:          v.Duration,
 		Bitrate:                  v.Bitrate,
 		FormatScore:              v.FormatScore,
+		MatchedFormats:           v.MatchedFormats,
 		AddedAt:                  NewInstant(v.AddedAt),
 		EditionRaw:               v.EditionRaw,
 		EditionKey:               v.EditionKey,

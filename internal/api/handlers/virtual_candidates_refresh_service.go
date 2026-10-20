@@ -25,6 +25,13 @@ const virtualCandidatesRefreshTimeout = 30 * time.Second
 // answers a retryable dependency problem and never touches the persisted rows.
 var ErrVirtualRefreshProvider = errors.New("virtual candidate provider refresh failed")
 
+// errVirtualNoCandidates marks a provider listing that completed successfully
+// with zero candidates. It is a valid empty answer, not a provider failure:
+// discovery answers it as success and leaves the stored rows untouched. It is
+// wrapped in ErrVirtualRefreshProvider so the refresh surfaces keep their
+// existing retryable-error contract.
+var errVirtualNoCandidates = errors.New("provider returned no candidates")
+
 // refreshEmbeddedURLPattern matches request URLs embedded in transport error
 // text (a *url.Error renders as `Get "https://host/path?query": ...`). Provider
 // URLs may carry credentials or tokens, so they are redacted from any message
@@ -37,12 +44,14 @@ var refreshEmbeddedURLPattern = regexp.MustCompile(`https?://[^\s"']+`)
 // the message. A bare "the provider could not be reached" cannot distinguish
 // a dead endpoint from a slow one, a rate limit, an ID-translation failure,
 // or an empty answer — and the async job persists exactly this message, so
-// the version-list banner can only show what is kept here.
+// the version-list banner can only show what is kept here. Discovery does not
+// reach this mapping for an empty answer: it treats that as a successful empty
+// result, while an explicit refresh keeps the retryable answer.
 func providerUnavailableError(err error) error {
+	if errors.Is(err, errVirtualNoCandidates) {
+		return apiError(http.StatusServiceUnavailable, "unavailable", "The provider answered but listed no candidates; try again.")
+	}
 	if cause := refreshProviderCause(err); cause != "" {
-		if strings.Contains(cause, "provider returned no candidates") {
-			return apiError(http.StatusServiceUnavailable, "unavailable", "The provider answered but listed no candidates; try again.")
-		}
 		return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached ("+cause+"); try again.")
 	}
 	return apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
@@ -107,6 +116,7 @@ type VirtualCandidatesDetailReader interface {
 // provider failure is retryable and never destructive: the persisted rows are
 // only replaced by a successful fresh listing.
 type VirtualCandidatesRefreshService struct {
+	ListCached VirtualPlaybackStreamLister
 	// ListFresh force-lists provider candidates for one virtual source path.
 	ListFresh VirtualPlaybackStreamLister
 	// Persist replaces the stored candidates for one source row; it is the same
@@ -119,6 +129,19 @@ type VirtualCandidatesRefreshService struct {
 	// Detail reads the pre- and post-refresh watch detail, which also enforces
 	// access and produces the version wire shape.
 	Detail VirtualCandidatesDetailReader
+	// ScheduleDefaultFileProbe, when non-nil, is called from inside the shared
+	// listing work immediately after a discovery run successfully persists one
+	// source group (never for :refresh runs). The hand-off is the successful
+	// persistence itself, not the request's return: the request-side caller
+	// can time out, disconnect, or release its budget before the winner lands
+	// the listing, while the detached work — and the chain scheduled from it —
+	// continues. The callback must be non-blocking: admission (an atomic
+	// check) only; the chain's own reads and probing happen in admitted work.
+	// The access filter is the one that authorized the discovery run (the
+	// singleflight winner's, when callers coalesce), so the chain resolves the
+	// same visible default the discovery response offered.
+	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
+	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
 
 	flight singleflight.Group
 }
@@ -130,13 +153,48 @@ type VirtualCandidatesRefreshService struct {
 const virtualURIScheme = "virtual"
 
 func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
-	if s == nil || s.ListFresh == nil || s.Persist == nil || s.Detail == nil {
+	if s == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
+	}
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListFresh, "refresh:")
+}
+
+func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
+	if s == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate discovery is unavailable")
+	}
+	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:")
+}
+
+// HasVirtualSource reports whether the item holds at least one persisted
+// virtual candidate group. It reads the same server-side rows as discovery,
+// independent of any viewer redaction: catalog detail responses strip file
+// paths for most viewers, so a caller that redacted versions cannot decide
+// eligibility from them. The caller must already have authorized the viewer's
+// access to the item; this lookup is content-keyed and carries no filtering.
+func (s *VirtualCandidatesRefreshService) HasVirtualSource(ctx context.Context, contentID string) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	sources, err := s.virtualSources(ctx, contentID)
+	if err != nil {
+		return false, err
+	}
+	return len(sources) > 0, nil
+}
+
+func (s *VirtualCandidatesRefreshService) listVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, lister VirtualPlaybackStreamLister, keyPrefix string) ([]catalog.FileVersion, error) {
+	if lister == nil || s.Persist == nil || s.Detail == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
 	}
 	// The pre-refresh read validates the target and the caller's access through
 	// the same path the version list uses.
-	if _, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter); err != nil {
+	before, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
+	if err != nil {
 		return nil, err
+	}
+	if keyPrefix == "discover:" && (before == nil || (before.Type != itemTypeMovie && before.Type != itemTypeEpisode)) {
+		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "Select a movie or an individual episode to discover versions.")
 	}
 	sources, err := s.virtualSources(ctx, contentID)
 	if err != nil {
@@ -145,8 +203,16 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 	if len(sources) == 0 {
 		return nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
 	}
+	// Only discovery schedules the pre-play probe chain. The ":refresh" job
+	// path force-lists under operator intent and carries its own enrichers;
+	// a chain on top would double-probe rows that path already targets.
+	var chainKey string
+	if keyPrefix == "discover:" {
+		chainKey = contentID
+	}
+	sawCandidateListing := false
 	for _, source := range sources {
-		key := virtualSourceRefreshKey(source)
+		key := keyPrefix + virtualSourceRefreshKey(source)
 		// Do not bind the shared work to the first caller's context: a client
 		// disconnect must not cancel the provider re-list (or strand a
 		// coalesced waiter on a canceled context). The shared work runs under
@@ -155,7 +221,7 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
-			_, err := s.refreshSource(workCtx, source, userID, profileID)
+			_, err := s.listSource(workCtx, source, userID, profileID, lister, chainKey, filter)
 			return nil, err
 		})
 		var refreshRes singleflight.Result
@@ -168,14 +234,28 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		case refreshRes = <-refreshCh:
 		}
 		if refreshRes.Err != nil {
+			if keyPrefix == "discover:" && errors.Is(refreshRes.Err, errVirtualNoCandidates) {
+				// The provider answered with zero candidates. Discovery treats
+				// that as a valid empty result rather than a dependency
+				// failure; the listing was not persisted, so stored rows stay
+				// untouched.
+				continue
+			}
 			if errors.Is(refreshRes.Err, ErrVirtualRefreshProvider) {
 				return nil, providerUnavailableError(refreshRes.Err)
 			}
 			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to refresh virtual candidates")
 		}
+		sawCandidateListing = true
 		// A coalesced waiter reuses the winner's persistence; nothing more to
 		// do for this source.
 		_ = refreshRes.Shared
+	}
+	if keyPrefix == "discover:" && !sawCandidateListing {
+		// Every provider source answered with an empty listing. Report the
+		// true empty result instead of re-reading a detail whose versions were
+		// never this discovery's answer.
+		return []catalog.FileVersion{}, nil
 	}
 	detail, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
 	if err != nil {
@@ -247,25 +327,32 @@ func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, co
 }
 
 // refreshSource force-lists one virtual source group and persists the result,
-// returning the persisted streams so the caller can reuse the listing.
+// returning the persisted streams so the caller can reuse the listing. The
+// empty chain key schedules nothing: refresh runs target rows through their
+// own job machinery.
 func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
+	return s.listSource(ctx, source, userID, profileID, s.ListFresh, "", catalog.AccessFilter{})
+}
+
+func (s *VirtualCandidatesRefreshService) listSource(ctx context.Context, source *models.MediaFile, userID int, profileID string, lister VirtualPlaybackStreamLister, chainKey string, filter catalog.AccessFilter) ([]VirtualPlaybackStream, error) {
 	if source == nil {
 		return nil, nil
 	}
 	listCtx, cancel := context.WithTimeout(ctx, virtualCandidatesRefreshTimeout)
 	defer cancel()
-	streams, err := s.ListFresh.ListVirtualPlaybackStreams(
+	streams, err := lister.ListVirtualPlaybackStreams(
 		listCtx, source.FilePath, userID, profileID, source.VirtualOwnerInstallationID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
 	}
 	if len(streams) == 0 {
-		// A zero-count listing is a provider hiccup, not an empty title. It must
-		// not reach ReplaceVirtualCandidates: persisting it would sweep or
-		// rewrite healthy stored candidates. Surface the same retryable provider
-		// failure the caller already understands, and leave the rows untouched.
-		return nil, fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
+		// A zero-count listing is a valid empty provider answer, not a
+		// reachability failure. It must not reach ReplaceVirtualCandidates:
+		// persisting it would sweep or rewrite healthy stored candidates.
+		// Discovery treats the sentinel as an empty success; the explicit
+		// refresh surfaces keep answering it as retryable.
+		return nil, fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, errVirtualNoCandidates)
 	}
 	// Persist under the listing timeout, not the detached caller context: the
 	// database write must not outlive the provider budget that bounds this
@@ -273,6 +360,18 @@ func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, sou
 	// waiter disconnect; it must not make persistence unbounded.)
 	if err := s.Persist(listCtx, source, streams); err != nil {
 		return nil, err
+	}
+	if chainKey != "" && s.ScheduleDefaultFileProbe != nil {
+		// Persistence landed: schedule the pre-play probe chain from here —
+		// inside the detached shared work, not on the request side — so a
+		// winner whose waiter has already disconnected still schedules it.
+		// The callback only admits and snapshots; it must never delay the shared
+		// answer coalesced waiters read. Pass a copy so the singleflight value
+		// cannot be aliased by the chain. The filter is the winner's — for a
+		// coalesced wave that is the run whose persistence this is.
+		copied := make([]VirtualPlaybackStream, len(streams))
+		copy(copied, streams)
+		s.ScheduleDefaultFileProbe(chainKey, source, copied, filter)
 	}
 	return streams, nil
 }

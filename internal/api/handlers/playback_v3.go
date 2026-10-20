@@ -107,6 +107,11 @@ const (
 	// survive a concurrent stop instead of collapsing to a not-found.
 	virtualSourceUnavailableReasonV3  = "virtual_source_unavailable"
 	replanVirtualInputTimeoutReasonV3 = "replan_virtual_input_timeout"
+	// seekReanchorEvidenceUnavailableReasonV3 is the retryable transport reason
+	// for a seek reanchor whose frozen candidate's own evidence and installation
+	// owner cannot be established from the session. The seek fails closed rather
+	// than replaying the frozen recipe through a moved binding's owner.
+	seekReanchorEvidenceUnavailableReasonV3 = "seek_reanchor_evidence_unavailable"
 	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
 	// a local generation whose decoder already rejected the source. It is never
 	// a client terminal: the start/replan rotation loop consumes it to substitute
@@ -241,6 +246,15 @@ func (t *playbackStartTimingsV3) log(ctx context.Context, attemptID string) {
 	slog.InfoContext(ctx, "protocol v3 start timing", attrs...)
 }
 
+// The phases added after the original split, named as constants so their
+// repeated use at the recorder call sites stays a single source of truth.
+const (
+	transportPhasePersistV3    = "transport_persist"
+	transportPhaseAuthorityV3  = "transport_authority"
+	transportPhaseCapabilityV3 = "transport_capability"
+	transportPhaseManifestV3   = "transport_manifest"
+)
+
 // transportPhaseNamesV3 is the fixed, ordered phase set the transport commit is
 // split into. Ordering keeps the emitted attributes stable across requests so a
 // log processor can diff two starts field by field.
@@ -252,6 +266,14 @@ var transportPhaseNamesV3 = []string{
 	"transport_spawn",
 	"transport_readiness",
 	"transport_remote_ready",
+	// The durable-write, authority-write, capability-probe, and manifest-poll
+	// spans below were left dark by the original split: they are on the start
+	// critical path but no phase named them. Appended after the original set so
+	// the existing fields keep their position and a log processor can diff.
+	transportPhasePersistV3,
+	transportPhaseAuthorityV3,
+	transportPhaseCapabilityV3,
+	transportPhaseManifestV3,
 }
 
 // transportPhaseTimingsV3 accumulates the wall time of the transport-commit
@@ -271,6 +293,33 @@ type transportPhaseTimingsV3 struct {
 }
 
 type transportPhaseTimingsKeyV3 struct{}
+
+// transportPhaseSuppressKeyV3 marks a context subtree whose phase writes are
+// discarded. The pooled capability fan-out installs it on the context shared by
+// its concurrent workers: each worker records its own duration, so parallel
+// spans would sum additively past the wall time the route span can net out. The
+// batch records its own wall time once instead, while standalone callers keep
+// their per-lookup recording.
+type transportPhaseSuppressKeyV3 struct{}
+
+// withoutTransportPhaseRecordingV3 returns ctx marked so phase writes on it and
+// its descendants are no-ops. A nil ctx stays nil.
+func withoutTransportPhaseRecordingV3(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, transportPhaseSuppressKeyV3{}, true)
+}
+
+// transportPhaseRecordingSuppressedV3 reports whether ctx belongs to a subtree
+// whose phase writes are discarded.
+func transportPhaseRecordingSuppressedV3(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	suppressed, _ := ctx.Value(transportPhaseSuppressKeyV3{}).(bool)
+	return suppressed
+}
 
 // withTransportPhaseTimingsV3 attaches a fresh phase recorder to ctx and
 // returns it. A second call replaces the recorder so a nested or retried start
@@ -292,8 +341,12 @@ func transportPhaseTimingsFromV3(ctx context.Context) *transportPhaseTimingsV3 {
 }
 
 // recordTransportPhaseV3 adds the wall time since start to the named phase on
-// the context's recorder. It is a no-op without an installed recorder.
+// the context's recorder. It is a no-op without an installed recorder and on a
+// subtree marked by withoutTransportPhaseRecordingV3.
 func recordTransportPhaseV3(ctx context.Context, phase string, start time.Time) {
+	if transportPhaseRecordingSuppressedV3(ctx) {
+		return
+	}
 	recorder := transportPhaseTimingsFromV3(ctx)
 	if recorder == nil {
 		return
@@ -307,6 +360,9 @@ func recordTransportPhaseV3(ctx context.Context, phase string, start time.Time) 
 // phase. It lets a caller record an enclosing span net of a span recorded inside
 // it (spawn inside the hw_accel=auto walk) so the phases never overlap.
 func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Duration) {
+	if transportPhaseRecordingSuppressedV3(ctx) {
+		return
+	}
 	recorder := transportPhaseTimingsFromV3(ctx)
 	if recorder == nil {
 		return
@@ -317,6 +373,18 @@ func addTransportPhaseDurationV3(ctx context.Context, phase string, d time.Durat
 	recorder.mu.Lock()
 	recorder.phases[phase] += d
 	recorder.mu.Unlock()
+}
+
+// recordTransportPhaseNetOfV3 records the wall time since start under outer,
+// net of any time inner accumulated during the same span. A caller passes the
+// inner total it read before the span began so the enclosing phase stays
+// disjoint from the phase that names work it performed inline. The subtraction
+// floors at zero (addTransportPhaseDurationV3 clamps a negative duration), so a
+// clock or ordering surprise can only report a zero outer span; it never emits
+// a negative millisecond.
+func recordTransportPhaseNetOfV3(ctx context.Context, outer string, start time.Time, inner string, innerBefore time.Duration) {
+	innerDelta := transportPhaseDurationV3(ctx, inner) - innerBefore
+	addTransportPhaseDurationV3(ctx, outer, time.Since(start)-innerDelta)
 }
 
 // transportPhaseDurationV3 reads the wall time accumulated for one phase on the
@@ -615,6 +683,12 @@ func (h *PlaybackHandler) localToneMapCapabilitiesCachedV3(ctx context.Context) 
 }
 
 func (h *PlaybackHandler) localToneMapCapabilitiesForTransportV3(ctx context.Context) (tonemap.Capabilities, error) {
+	// The transport-time local tone-map probe is a hardware walk that can take
+	// seconds on a cold device set. It was uncovered by the original split, so
+	// name it as its own capability phase on the request recorder. The startup
+	// warmup calls the cached variant on a context without a recorder and is
+	// unaffected.
+	defer recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, time.Now())
 	probeCtx, cancel := context.WithTimeout(ctx, h.localToneMapProbeTimeoutV3())
 	defer cancel()
 	return h.localToneMapCapabilitiesV3(probeCtx)
@@ -748,6 +822,11 @@ func (h *PlaybackHandler) lookupRemoteTransformationsV3(ctx context.Context, nod
 // lookupRemoteCapabilitiesV3 fetches and jointly caches a node's transformation
 // and tone-map inventory, optionally reusing short-lived fetch failures.
 func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeURL string, honorCachedFailure bool) (v3NodeCapabilityCache, error) {
+	// A remote capability read is a node round-trip on the start path that the
+	// original split left dark. Record it as its own phase wherever the request
+	// carries a recorder; a background refresh or warmup runs on a context
+	// without one, so it pays nothing and stays out of the request's phases.
+	defer recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, time.Now())
 	// Canonical here and in RefreshNodeCapabilitiesV3, which are the two ways
 	// into these maps; everything below is reached from one of them and so is
 	// already keyed the same way.
@@ -1608,8 +1687,19 @@ func (h *PlaybackHandler) pooledNodeTransformationsV3(ctx context.Context, nodeU
 }
 
 func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs []string) map[string]v3NodeCapabilityCache {
+	if len(nodeURLs) == 0 {
+		return map[string]v3NodeCapabilityCache{}
+	}
+	// The lookups below run concurrently. Each one records its own capability
+	// span, and parallel spans would sum additively into transport_capability —
+	// more than the wall time route resolution can net out (and the batch itself
+	// only spans one wall-clock interval). Suppress their recording on the shared
+	// batch context and name the fan-out's own wall time once below; standalone
+	// callers outside the pool keep their per-lookup recording.
+	batchStart := time.Now()
 	fetchCtx, cancel := context.WithTimeout(ctx, v3NodeCapabilityPlanTimeout)
 	defer cancel()
+	lookupCtx := withoutTransportPhaseRecordingV3(fetchCtx)
 	results := make([]v3NodeCapabilityCache, len(nodeURLs))
 	available := make([]bool, len(nodeURLs))
 	var wg sync.WaitGroup
@@ -1617,7 +1707,7 @@ func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs
 		wg.Add(1)
 		go func(i int, nodeURL string) {
 			defer wg.Done()
-			entry, err := h.lookupRemoteCapabilitiesV3(fetchCtx, nodeURL, true)
+			entry, err := h.lookupRemoteCapabilitiesV3(lookupCtx, nodeURL, true)
 			if err != nil {
 				slog.DebugContext(ctx, "protocol v3 node capability unavailable for planning", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
 				return
@@ -1627,6 +1717,7 @@ func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs
 		}(i, nodeURL)
 	}
 	wg.Wait()
+	recordTransportPhaseV3(ctx, transportPhaseCapabilityV3, batchStart)
 	byURL := make(map[string]v3NodeCapabilityCache, len(nodeURLs))
 	for i, entry := range results {
 		if available[i] {
@@ -1928,8 +2019,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// attempt, which virtual candidate rotation replaces. Drop it before the
 	// structural id/index check, mirroring the replan path's re-key-before-
 	// validation order: the start degrades to the default track pipeline
-	// instead of failing 400. NormalizeAndValidate applies the same drop as a
-	// second line of defense for callers that validate a copy (api/v2).
+	// instead of failing 400. The file-independent structural checks run first:
+	// the drop clears both id and index, so a negative index other than the off
+	// sentinel, or the off sentinel paired with an id, would otherwise pass as a
+	// plain omission and — under a stored "always" subtitle mode — auto-select
+	// subtitles. NormalizeAndValidate repeats both steps as a second line of
+	// defense for callers that validate a copy (api/v2).
+	if err := req.ValidateSelectedTrackStructureV3(); err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
+	}
 	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
@@ -2238,6 +2336,22 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// three together and could not say which one consumed the budget.
 	effectiveSubtitles := subtitleInventoryFor(effectiveFile)
 	timings.mark("subtitle_inventory")
+	// Apply the profile's stored "always" subtitle mode before planning so the
+	// first plan carries the burn-in requirement: a bitmap subtitle that must be
+	// burned in forces the burn-in video codec, and discovering that only after
+	// the first FFmpeg start costs a second plan and a second spawn. Any named
+	// selection is never overridden; an omitted selection defers to the stored
+	// mode, so for an "always" profile an omitted start field turns subtitles on
+	// where it previously left them off. An explicit off (subtitle_track_index
+	// = -1) is a named intent too: it skips this and plans subtitles off for
+	// one start without changing the stored mode.
+	if req.SubtitleTrackID == "" && req.SubtitleTrackIndex == nil {
+		if subtitleIndex, ok := h.resolvePreferredSubtitleSelectionV3(r.Context(), userID, profileID, deviceID, effectiveFile, effectiveSubtitles); ok {
+			indexCopy := subtitleIndex
+			req.SubtitleTrackIndex = &indexCopy
+		}
+	}
+	timings.mark("subtitle_selection")
 	transformationRegistry := h.transformationRegistryV3(r.Context())
 	dvrpuStrippable := h.lazyDVRPUStrippableV3(r.Context(), effectiveFile)
 	timings.mark("transform_registry")
@@ -3548,12 +3662,20 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		slog.WarnContext(r.Context(), "protocol v3 start: audio selection intent not recorded on the session",
 			"component", "api", "session", session.ID, "error", err)
 	}
+	// The durable session-state and attempt writes are on the start critical
+	// path but were uncovered by the original phase split: session creation and
+	// the attempt record are what session_transport_commit measured without
+	// naming. Time both writes as one persist phase, recording exactly once on
+	// each exit path so the two durable writes are never double-counted.
+	persistStart := time.Now()
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 		transport.rollback()
 		abort()
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to commit the live playback session.", cause: err}
 	}
 	if err := h.PlanStoreV3.SaveAttempt(r.Context(), record); err != nil {
+		recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 		transport.rollback()
 		abort()
 		if errors.Is(err, playback.ErrPlaybackAttemptExistsV3) || errors.Is(err, playback.ErrIdempotencyKeyReusedV3) {
@@ -3576,6 +3698,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		}
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to persist the playback plan.", cause: err}
 	}
+	recordTransportPhaseV3(r.Context(), transportPhasePersistV3, persistStart)
 	if commitErr := transport.commit(); commitErr != nil {
 		abort()
 		return playback.DecisionResponseV3{}, commitErr
@@ -3822,9 +3945,15 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			slog.WarnContext(r.Context(), "protocol v3 transport route loop reached time budget", logComponentKey, playbackLogValueV3, "elapsed_ms", time.Since(loopStartedAt).Milliseconds(), "attempts", attempts)
 			break
 		}
+		// The route resolver fans out per-node capability lookups to build its
+		// eligibility predicate, and those record transport_capability inside
+		// this span. Record route net of that delta so the two phases stay
+		// disjoint: the node probes are named as capability, the pure routing
+		// decision as route.
 		routeStart := time.Now()
+		capabilityBefore := transportPhaseDurationV3(r.Context(), transportPhaseCapabilityV3)
 		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
-		recordTransportPhaseV3(r.Context(), "transport_route", routeStart)
+		recordTransportPhaseNetOfV3(r.Context(), "transport_route", routeStart, transportPhaseCapabilityV3, capabilityBefore)
 		if !decision.Selected() {
 			if canRetrySoftwareToneMapV3(result) {
 				if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
@@ -4328,9 +4457,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// a second probe cannot be started only to be truncated by the
 			// deadline.
 			//
-			// An upstream 5xx is a transient provider failure: it is retried the
-			// same way, but only after a short bounded backoff, so a provider
-			// that is already failing is not hammered by an immediate re-probe.
+			// An upstream 5xx and a probe signal-killed from outside (the OOM
+			// killer or an operator) are transient failures: they are retried
+			// the same way, but only after a short bounded backoff, so a
+			// provider that is already failing is not hammered by an immediate
+			// re-probe. A caller cancellation never reaches this branch: the
+			// loop stops before scheduling a retry.
 			retryReserved := copySeekAnchorRetryReserved(ctx)
 			lastProbedInput := ""
 			var err error
@@ -4871,6 +5003,12 @@ func (h *PlaybackHandler) putProxyGrantV3(ctx context.Context, sessionID string,
 	if h.ProxyGrantStore == nil || !h.ProxyGrantStore.Enabled() || sessionID == "" {
 		return nil, false
 	}
+	// The proxy grant is this session's egress authority: a durable store
+	// round-trip on the start path that the original split did not name. Record
+	// it as the authority phase. grantManifestURLV3 stores through here, so its
+	// write is covered by this same span rather than wrapped again. A disabled
+	// store returns before this, so a no-op never inflates the phase.
+	defer recordTransportPhaseV3(ctx, transportPhaseAuthorityV3, time.Now())
 	prior, hadPrior := h.ProxyGrantStore.Get(ctx, sessionID)
 	if !hadPrior {
 		prior = nil
@@ -4950,6 +5088,11 @@ func (h *PlaybackHandler) putRequiredNodeRecipeV3(ctx context.Context, transport
 	if h == nil || h.NodeRecipeStore == nil || !h.NodeRecipeStore.Enabled() || transportID == "" {
 		return errors.New("node recipe store unavailable")
 	}
+	// The required node recipe is route admission, so this durable write is on
+	// the start path and uncovered by the original split. Record it as the
+	// authority phase. An unavailable store returns before this, so the failed
+	// admission is not charged to the phase.
+	defer recordTransportPhaseV3(ctx, transportPhaseAuthorityV3, time.Now())
 	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
 	defer cancel()
 	return h.NodeRecipeStore.Put(putCtx, transportID, card)
@@ -5644,16 +5787,21 @@ type localTransportStartupFailureV3 struct {
 // returned so every caller gets the same startup cleanup behavior.
 func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
 	startedAt := time.Now()
-	// Spawn is recorded net of the virtual upstream reopen it performs inline:
-	// resolving the session-bound provider URL to a relay registration is the
-	// "upstream reopen" phase, and counting it twice would make the two phases
-	// overlap. For a local file the resolve is a no-op and spawn keeps the whole
-	// span.
+	// Spawn is recorded net of the virtual upstream reopen and the virtual
+	// transport's inline manifest wait, both of which the launch performs
+	// before it returns: resolving the session-bound provider URL to a relay
+	// registration is the "upstream reopen" phase, and awaiting the first
+	// manifest is the "manifest" phase, so counting either twice would make the
+	// phases overlap. For a local file both are no-ops and spawn keeps the
+	// whole span.
 	upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+	manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 	ts, err := h.startLocalPlaybackTransport(ctx, opts)
 	spawnFinishedAt := time.Now()
 	addTransportPhaseDurationV3(ctx, "transport_spawn",
-		spawnFinishedAt.Sub(startedAt)-(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore))
+		spawnFinishedAt.Sub(startedAt)-
+			(transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore)-
+			(transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore))
 	if err != nil {
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
@@ -5674,7 +5822,13 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		}
 		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
 	}
-	if _, err := ts.WaitForManifestContext(ctx, playback.ManifestStartupTimeout); err != nil {
+	// The local first-manifest wait is this request's readiness phase. Report
+	// how many poll iterations it ran too: the duration says how long the
+	// client waited, and the count separates a manifest that appeared promptly
+	// from one that rode the deadline out. The count is additive log
+	// observation; the wait and its result are unchanged.
+	_, manifestPolls, manifestErr := ts.WaitForManifestContextPolls(ctx, playback.ManifestStartupTimeout)
+	if manifestErr != nil {
 		recordTransportPhaseV3(ctx, "transport_readiness", spawnFinishedAt)
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
@@ -5683,11 +5837,12 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 			"session", opts.SessionID,
 			"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
 			"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+			"manifest_polls", manifestPolls,
 			"total_ms", time.Since(startedAt).Milliseconds(),
 			"outcome", "readiness_failed",
 		)
 		failure := &localTransportStartupFailureV3{
-			cause:        err,
+			cause:        manifestErr,
 			wasRunning:   ts.IsRunning(),
 			failedDevice: ts.Opts().HWDevice,
 		}
@@ -5702,6 +5857,7 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		"session", opts.SessionID,
 		"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
 		"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
+		"manifest_polls", manifestPolls,
 		"total_ms", time.Since(startedAt).Milliseconds(),
 		"outcome", transportStartupReadyV3,
 	)
@@ -5724,6 +5880,16 @@ func (h *PlaybackHandler) newAutoTranscodePipelineV3(ctx context.Context, opts p
 // ManifestStartupTimeout. A variable so tests can shrink it.
 var localAutoStartupBudgetV3 = time.Duration(playback.MaxAutoTranscodeStartupAttempts)*playback.ManifestStartupTimeout + 5*time.Second
 
+// addTransportReadinessNetOfWalkV3 records an enabled hw_accel=auto walk's
+// readiness as its wall time net of the spans already named during the walk:
+// FFmpeg spawn, the upstream reopen, and any inline first-manifest wait. Each
+// delta is the phase total after the walk minus its total before, so a
+// multi-attempt walk and a reused recorder both net correctly. The result floors
+// at zero in addTransportPhaseDurationV3.
+func addTransportReadinessNetOfWalkV3(ctx context.Context, elapsed, spawn, upstream, manifest time.Duration) {
+	addTransportPhaseDurationV3(ctx, "transport_readiness", elapsed-spawn-upstream-manifest)
+}
+
 // startReadyAutoLocalPlaybackTransportV3 walks an enabled hw_accel=auto
 // pipeline until one path produces its first manifest. Failed attempts are
 // closed by the pipeline loop, so the failure carries the same cleanup
@@ -5738,23 +5904,32 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 	startedAt := time.Now()
 	attempts := 0
 	spawnBefore := transportPhaseDurationV3(ctx, "transport_spawn")
+	upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+	manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 	ts, err := playback.StartReadyTranscode(ctx, pipeline, playback.TranscodeStartup{
 		Budget: localAutoStartupBudgetV3,
 		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 			attempts++
 			upstreamBefore := transportPhaseDurationV3(ctx, "transport_upstream")
+			manifestBefore := transportPhaseDurationV3(ctx, transportPhaseManifestV3)
 			spawnStart := time.Now()
 			session, startErr := h.startLocalPlaybackTransport(ctx, opts)
 			upstreamDelta := transportPhaseDurationV3(ctx, "transport_upstream") - upstreamBefore
-			addTransportPhaseDurationV3(ctx, "transport_spawn", time.Since(spawnStart)-upstreamDelta)
+			manifestDelta := transportPhaseDurationV3(ctx, transportPhaseManifestV3) - manifestBefore
+			addTransportPhaseDurationV3(ctx, "transport_spawn", time.Since(spawnStart)-upstreamDelta-manifestDelta)
 			return session, startErr
 		},
 	})
 	// The auto walk bounds spawn and per-attempt manifest readiness together.
-	// Readiness is the walk's wall time net of the (possibly multi-attempt) spawn
-	// time already recorded above, so the two phases stay disjoint.
-	spawnAfter := transportPhaseDurationV3(ctx, "transport_spawn")
-	addTransportPhaseDurationV3(ctx, "transport_readiness", time.Since(startedAt)-(spawnAfter-spawnBefore))
+	// Readiness is the walk's wall time net of every span already named during
+	// it: spawn, the upstream reopen, and the virtual transport's inline
+	// first-manifest wait. Spawn is recorded net of the last two, so subtracting
+	// only spawn would count the manifest wait in both transport_manifest and
+	// transport_readiness.
+	addTransportReadinessNetOfWalkV3(ctx, time.Since(startedAt),
+		transportPhaseDurationV3(ctx, "transport_spawn")-spawnBefore,
+		transportPhaseDurationV3(ctx, "transport_upstream")-upstreamBefore,
+		transportPhaseDurationV3(ctx, transportPhaseManifestV3)-manifestBefore)
 	outcome := transportStartupReadyV3
 	var failure *localTransportStartupFailureV3
 	var startupErr *playback.TranscodeStartupError
@@ -6618,8 +6793,9 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	// and the source revision anchor that evidence to the exact candidate, so
 	// the serve path can discard it when the bound candidate has moved.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
+		owner := effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
 		state.VirtualSourceURI = file.FilePath
-		state.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
+		state.VirtualSourceOwnerInstallationID = owner
 		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
@@ -6630,7 +6806,21 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		// later serve must apply this inventory only to the exact row it was
 		// captured from, never to a sibling row the probe rotated onto.
 		state.VirtualSubtitleEvidenceFileID = file.ID
-		state.VirtualSubtitleEvidenceSet = file.ProbeUpdatedAt != nil
+		// The evidence owner travels with the URI and row id so a later seek
+		// reanchor can restore the frozen candidate's own installation after a
+		// cross-installation binding move instead of borrowing the moved
+		// binding's owner.
+		state.VirtualSubtitleEvidenceOwnerInstallationID = owner
+		// The evidence-set flag is normally the row's probe stamp. When the
+		// session already retains evidence for this exact candidate — a seek
+		// reanchor or a same-candidate carry commits that inventory — the row
+		// may carry no stamp (a churned listing row) even though the retained
+		// evidence is proven, so the session's own flag is the authority.
+		evidenceSet := file.ProbeUpdatedAt != nil
+		if !evidenceSet && sameVirtualCandidate(session.VirtualSubtitleEvidenceURI, file.FilePath) {
+			evidenceSet = session.VirtualSubtitleEvidenceSet
+		}
+		state.VirtualSubtitleEvidenceSet = evidenceSet
 	}
 	return state
 }
@@ -7466,7 +7656,7 @@ func replanSessionNotFoundV3() *PlaybackOperationError {
 // stop, because the stall — not the stop — is what the replan observed.
 func virtualSourceStallTerminalV3(reason string) bool {
 	switch reason {
-	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3:
+	case virtualSourceUnavailableReasonV3, replanVirtualInputTimeoutReasonV3, seekReanchorEvidenceUnavailableReasonV3:
 		return true
 	default:
 		return false
@@ -8575,31 +8765,76 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// source_unavailable through the existing rotation semantics
 			// instead of the replan planning against stale metadata. The
 			// release is never swapped silently.
+			//
+			// pinnedRowProvenance is the one evaluation of "the session's
+			// retained evidence describes the pinned row". Every admission path
+			// reads it, including the candidateUnchanged shortcut: a same-row
+			// binding move can leave the reloaded row naming the new pin while
+			// the running plan's descriptor still describes the previous
+			// candidate, and row-id equality alone cannot tell that apart from a
+			// same-release re-plan. sessionProvenanceMatchesPinnedRowV3 is the
+			// authority for that judgement.
+			pinnedRowProvenance := sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver)
+			// A carry tops the carried row up with the running plan's validated
+			// source descriptor, so the descriptor must describe the candidate
+			// being carried. Session provenance alone cannot prove that: serving
+			// or probing can advance the session's evidence to another candidate
+			// while the durable plan still describes the previous one, and the
+			// carry would then pair the old descriptor with the new bytes.
+			planCarriesPin := sameVirtualCandidate(strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI), strings.TrimSpace(session.VirtualSourceURI))
 			carryPinnedCandidate := (trackChange || seekReanchor) && !virtualDecodeRotation &&
 				strings.TrimSpace(session.VirtualSourceURI) != "" &&
+				pinnedRowProvenance &&
+				planCarriesPin &&
+				// A user-intent replan keeps the session's pinned candidate when
+				// the reloaded row is the pin's own row under a churned
+				// per-listing token (the probe-evidence flag) or that profile's
+				// provider-neutral row (virtualPinnedProfileRowV3). The provider
+				// churns the per-listing result id for bytes that never changed,
+				// so a re-listing pays a multi-second round-trip to hand back a
+				// token the identity guard then refuses to adopt. Admission is
+				// provenance-checked, not presence-checked: a stop, a binding
+				// move, or a rotation can leave the anchor naming the previous
+				// candidate, and trusting it would bypass resolution while the
+				// binder, which rejects the mismatch, cannot supply trustworthy
+				// inventory. A row whose only relationship to the pin is a
+				// different release keeps re-resolving, so an offline pin
+				// surfaces as source_unavailable through the existing rotation
+				// semantics instead of planning against a stub. The release is
+				// never swapped silently.
 				(candidateUnchanged ||
-					// A user-intent replan keeps the session's pinned candidate
-					// when the reloaded row is the pin's own row under a churned
-					// per-listing token (the probe-evidence flag) or that
-					// profile's provider-neutral row (virtualPinnedProfileRowV3),
-					// AND the session's retained provenance actually describes
-					// the pin and the row being bound. The provider churns the
-					// per-listing result id for bytes that never changed, so a
-					// re-listing pays a multi-second round-trip to hand back a
-					// token the identity guard then refuses to adopt. Admission
-					// is provenance-checked, not presence-checked: a stop, a
-					// binding move, or a rotation can leave the anchor naming the
-					// previous candidate, and trusting it would bypass resolution
-					// while the binder, which rejects the mismatch, cannot supply
-					// trustworthy inventory. A row whose only relationship to the
-					// pin is a different release keeps re-resolving, so an
-					// offline pin surfaces as source_unavailable through the
-					// existing rotation semantics instead of planning against a
-					// stub. The release is never swapped silently.
-					(sessionProvenanceMatchesPinnedRowV3(r.Context(), session, currentEffectiveFile, h.fileResolver) &&
-						(session.VirtualSubtitleEvidenceSet ||
-							virtualPinnedProfileRowV3(session, currentEffectiveFile))))
-			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
+					session.VirtualSubtitleEvidenceSet ||
+					virtualPinnedProfileRowV3(session, currentEffectiveFile))
+			// A seek reanchor replays the frozen recipe verbatim, so the bytes
+			// it continues are the running plan's candidate, not the session's
+			// pin. When the pin has moved since the plan was committed, binding
+			// the pin would pair the replayed descriptor and recipe with a
+			// different release's bytes — the franken-evidence the carry gate
+			// exists to refuse. Bind the plan's own candidate instead, and do it
+			// ahead of the same-row shortcuts so the effective file, the
+			// replayed plan, and the transport all describe one release.
+			seekReanchorCandidate := ""
+			if seekReanchor && record.FrozenRecipe.ValidFor(record.CurrentPlan) {
+				seekReanchorCandidate = strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+			}
+			if seekReanchorCandidate != "" {
+				// Rebuild the effective file for the frozen candidate from
+				// evidence that demonstrably belongs to it. The reloaded row may
+				// already describe another release, and the session's live pin
+				// and owner may have moved: replaying the frozen recipe through
+				// either would pair the running plan's descriptor and recipe with
+				// foreign bytes or another installation's credentials.
+				frozenCarrier, frozenErr := h.frozenSeekCarrierV3(r.Context(), session, record, currentEffectiveFile)
+				if frozenErr != nil {
+					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+						reason:    seekReanchorEvidenceUnavailableReasonV3,
+						message:   "The frozen playback source could not be reopened; start a new playback attempt.",
+						retryable: true,
+						cause:     frozenErr,
+					}
+				}
+				currentEffectiveFile = frozenCarrier
+			} else if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			} else if carryPinnedCandidate {
@@ -8621,6 +8856,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					carriedCopy.AudioTracks = session.VirtualAudioTracks
 					carried = &carriedCopy
 				}
+				// The catalog row may be a fresh listing row the provider has
+				// never let the probe stamp: it carries no bit depth, frame
+				// rate, or bitrate, and planning against it would terminal
+				// source_metadata_incomplete on a user-intent replan that
+				// re-selects within the release already playing. The running
+				// plan's validated source descriptor is the carried probe
+				// evidence for exactly these bytes, so prefer it over the
+				// unprobed row. Only gaps are filled. The provenance gate that
+				// admitted carryPinnedCandidate is what makes the descriptor
+				// current for these bytes; the carry itself can only compare
+				// row ids, never bytes.
+				carried = carryValidatedVirtualVideoEvidenceV3(carried, record.CurrentPlan.Source)
 				currentEffectiveFile = carried
 			} else {
 				// The session-bound release is preferred so re-ranking cannot
@@ -9986,6 +10233,13 @@ func seekReanchorIdentityChangesV3(record *playback.AttemptRecordV3, candidate *
 	add("quirks", !sameAppliedQuirksV3(candidate.AppliedQuirks, current.AppliedQuirks))
 	add("runtime_corrections", !sameStringMultisetV3(candidate.RuntimeCorrections, current.RuntimeCorrections))
 	add("claims", candidate.Claims != current.Claims)
+	// A seek reanchor replays the running plan's source binding, so the
+	// candidate may not name a different candidate URI or source descriptor. The
+	// frozen rebuild copies both from record.CurrentPlan, so this only fires on a
+	// future caller that plans a seek from live state instead; it is the source
+	// half of the route-identity guard the other fields already cover.
+	add("effective_virtual_uri", candidate.EffectiveVirtualURI != current.EffectiveVirtualURI)
+	add("source", candidate.Source != current.Source)
 	return changed
 }
 
@@ -11351,6 +11605,342 @@ func virtualPinnedProfileRowV3(session *playback.Session, row *models.MediaFile)
 	return sameVirtualProfileScope(rowPath, pinned)
 }
 
+// errFrozenSeekEvidenceUnavailable reports that a seek reanchor cannot
+// establish evidence or an installation owner that belongs to the frozen
+// candidate, so the recipe must not be replayed through a foreign binding.
+var errFrozenSeekEvidenceUnavailable = errors.New("the frozen seek candidate's own evidence is unavailable")
+
+// frozenSeekCarrierV3 builds the effective file a seek reanchor replays from
+// evidence that demonstrably belongs to the plan's frozen candidate. The
+// reloaded row is mutable: a provider rotation re-probes it in place, so it may
+// now name another release and carry that release's inventory and probe stamp,
+// while the session's pin and owner may have moved to the same other release.
+// Either would pair the replayed descriptor and recipe with foreign bytes.
+//
+// The candidate's own evidence is the session's retained inventory, anchored at
+// exactly the frozen candidate and row, or the reloaded row itself when it still
+// names the candidate. The candidate's own installation owner is the session's
+// live owner while the pin still names the candidate, the owner captured with
+// the session's evidence, or the row's owner while the row still names the
+// candidate. When none of those can be established the seek fails closed
+// (errFrozenSeekEvidenceUnavailable) rather than borrowing the moved binding's
+// owner or committing another release's inventory under the candidate's URI.
+func (h *PlaybackHandler) frozenSeekCarrierV3(ctx context.Context, session *playback.Session, record *playback.AttemptRecordV3, row *models.MediaFile) (*models.MediaFile, error) {
+	if session == nil || record == nil || row == nil {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	candidate := strings.TrimSpace(record.CurrentPlan.EffectiveVirtualURI)
+	if candidate == "" {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	rowNamesCandidate := sameVirtualCandidate(row.FilePath, candidate)
+	// Evaluate the session's evidence exactly as the binder does, but against
+	// the frozen candidate rather than the session's (possibly moved) pin.
+	bound := *row
+	bound.FilePath = candidate
+	sessionEvidence := virtualEvidenceMatchesBoundFile(ctx, &bound, session, h.fileResolver)
+	if !rowNamesCandidate && !sessionEvidence {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	owner := 0
+	if sameVirtualCandidate(session.VirtualSourceURI, candidate) {
+		owner = session.VirtualSourceOwnerInstallationID
+	}
+	if owner <= 0 && sessionEvidence {
+		owner = session.VirtualSubtitleEvidenceOwnerInstallationID
+	}
+	if owner <= 0 && rowNamesCandidate {
+		owner = row.VirtualOwnerInstallationID
+	}
+	if owner <= 0 {
+		return nil, errFrozenSeekEvidenceUnavailable
+	}
+	carrier := *row
+	carrier.FilePath = candidate
+	carrier.VirtualOwnerInstallationID = owner
+	if !rowNamesCandidate {
+		// The row describes another release: its inventory and probe stamp are
+		// not evidence for the frozen candidate. Carry the session's retained
+		// inventory for the candidate and drop the row's stamp so the state
+		// writer cannot stamp the foreign inventory as verified under the
+		// candidate's URI.
+		carrier.AudioTracks = session.VirtualAudioTracks
+		carrier.SubtitleTracks = session.VirtualSubtitleTracks
+		carrier.ExternalSubtitles = session.VirtualExternalSubtitles
+		carrier.ProbeUpdatedAt = nil
+	}
+	return carryValidatedVirtualVideoEvidenceV3(&carrier, record.CurrentPlan.Source), nil
+}
+
+// carryValidatedVirtualVideoEvidenceV3 tops up a carried pinned candidate's
+// planner-grade video evidence from the source descriptor the running plan
+// validated. A user-intent replan (track_change or seek_reanchor) re-selects
+// within the release already playing, and the carry predicate has already
+// proven the session's pinned evidence describes these bytes. When the reloaded
+// catalog row is a fresh listing row the provider never let the probe stamp, it
+// has no bit depth, frame rate, or bitrate and planning it would terminal
+// source_metadata_incomplete on metadata the running plan already validated —
+// the menu click and the unbuffered seek that appear inert. The plan's source
+// descriptor is the carried probe evidence for exactly these bytes, so it is
+// preferred over the unprobed row.
+//
+// Caller contract (precondition): the caller must already have established
+// against the session's retained provenance that the descriptor describes the
+// bytes this row now binds — see sessionProvenanceMatchesPinnedRowV3 and the
+// carryPinnedCandidate gate. Identity here is only the descriptor's
+// MediaFileID: a virtual catalog row can be re-probed in place under the same
+// id for different bytes, so row-id equality does not by itself prove the
+// descriptor is current. This function trusts the caller's provenance gate and
+// must never be invoked on a row whose staleness has not been ruled out.
+//
+// Only gaps are filled, and only when the descriptor names the same row and
+// agrees on the codec, so a row that already carries complete evidence, a
+// descriptor for another row, or a row whose declared codec conflicts with the
+// descriptor is left untouched.
+func carryValidatedVirtualVideoEvidenceV3(file *models.MediaFile, source playback.SourceDescriptorV3) *models.MediaFile {
+	if file == nil || !isVirtualPlaybackFile(file) {
+		return file
+	}
+	if completeVirtualVideoEvidenceV3(file) {
+		return file
+	}
+	if source.MediaFileID != file.ID || source.VideoCodec == "" ||
+		source.BitDepth <= 0 || source.Width <= 0 || source.Height <= 0 ||
+		source.FrameRate <= 0 || source.BitrateKbps <= 0 {
+		return file
+	}
+	// Never mix a row's declared codec with descriptor evidence for a different
+	// one. A row that declares h264 while the running plan validated hevc must
+	// not receive the descriptor's geometry: that is franken-evidence the
+	// planner would route against. Agreement uses the planner's own
+	// normalization, so "h265"/"hevc" and "h264"/"avc" compare equal.
+	if !virtualCodecAgreesV3(file, source.VideoCodec) {
+		return file
+	}
+	carried := *file
+	// Clone the video-track slice before the in-place top-up below. A shallow
+	// struct copy shares the backing array, so writing carried.VideoTracks[0]
+	// would mutate the caller's inventory and race any other reader of it.
+	carried.VideoTracks = append([]models.VideoTrack(nil), file.VideoTracks...)
+	if carried.CodecVideo == "" {
+		carried.CodecVideo = source.VideoCodec
+	}
+	if carried.Container == "" || strings.EqualFold(carried.Container, "virtual") {
+		if source.Container != "" {
+			carried.Container = source.Container
+		}
+	}
+	if carried.Bitrate == 0 {
+		// MediaFile.Bitrate is the probe's kbps figure (scanner/probe.go stores
+		// ffprobe bit_rate/1000), the same unit as
+		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
+		carried.Bitrate = source.BitrateKbps
+	}
+	if source.DynamicRange == playback.DynamicRangeHDRUnknownV3 {
+		// Unknown HDR carries no classifying range text: tonemap's classifier
+		// promotes any "hdr"-bearing VideoRangeType to HDR10, so the unknown
+		// grade survives only through the file-level HDR flag with no range text
+		// to classify. Setting it keeps the carried row's descriptor equal to
+		// the running plan's.
+		carried.HDR = true
+	}
+	if len(carried.VideoTracks) == 0 {
+		carried.VideoTracks = []models.VideoTrack{virtualVideoTrackFromDescriptorV3(source)}
+		return &carried
+	}
+	// The existing-track path fills the exact same field set the empty-track
+	// reconstruction does — both call fillVirtualVideoTrackFromDescriptorV3 —
+	// so a partial row is never left reading copy-safe on a source the running
+	// plan proved is not.
+	fillVirtualVideoTrackFromDescriptorV3(&carried.VideoTracks[0], source)
+	return &carried
+}
+
+// virtualCodecAgreesV3 reports whether every video-codec spelling the row
+// already declares agrees with the descriptor's codec under the planner's
+// normalization. An absent declaration is a gap and agrees by construction.
+func virtualCodecAgreesV3(file *models.MediaFile, sourceCodec string) bool {
+	if file == nil || strings.TrimSpace(sourceCodec) == "" {
+		return false
+	}
+	if declared := strings.TrimSpace(file.CodecVideo); declared != "" &&
+		!playback.CodecsAgreeV3(declared, sourceCodec) {
+		return false
+	}
+	if len(file.VideoTracks) > 0 {
+		if declared := strings.TrimSpace(file.VideoTracks[0].Codec); declared != "" &&
+			!playback.CodecsAgreeV3(declared, sourceCodec) {
+			return false
+		}
+	}
+	return true
+}
+
+// virtualVideoTrackFromDescriptorV3 reconstructs the primary video track the
+// running plan validated from its source descriptor. It builds an empty track
+// and fills it through fillVirtualVideoTrackFromDescriptorV3, so the
+// reconstruction and the in-place top-up of a partial row cover exactly the
+// same field set: the fields the planner reads for route selection (codec,
+// profile, level, bit depth, dimensions, frame rate, bitrate, color range, and
+// the dynamic-range classification via the range-type text, with the DV profile
+// carried explicitly) plus the aggregated copy-safety verdict. The session's DV
+// pin is applied after the carry and re-overwrites the profile for a pinned
+// row, so the two never disagree.
+func virtualVideoTrackFromDescriptorV3(source playback.SourceDescriptorV3) models.VideoTrack {
+	var track models.VideoTrack
+	fillVirtualVideoTrackFromDescriptorV3(&track, source)
+	return track
+}
+
+// Probe range tokens the tonemap classifier understands, named once so the
+// descriptor mapping does not repeat literals the package uses elsewhere.
+const (
+	videoRangeTokenDOVI      = "DOVI"
+	videoRangeTokenHDR10Plus = "HDR10Plus"
+	videoRangeTokenHLG       = "HLG"
+	videoRangeTokenHDR10     = "HDR10"
+	videoRangeTokenSDR       = "SDR"
+)
+
+// virtualVideoRangeTypeFromDescriptorV3 maps the running plan's normalized
+// dynamic-range label onto the row range token tonemap classifies from, so a
+// carried row's SourceDescriptorFromFileV3 round-trips to the same label. The
+// tokens mirror the probe's own vocabulary (mediaprobe.videoRangeType): "DOVI"
+// is the token tonemap recognizes as Dolby Vision — the label "dolby_vision"
+// contains no "dovi", so it would classify as SDR — and unknown HDR maps to no
+// token at all, because any "hdr"-bearing text is promoted to HDR10.
+func virtualVideoRangeTypeFromDescriptorV3(source playback.SourceDescriptorV3) string {
+	switch source.DynamicRange {
+	case playback.DynamicRangeDolbyVisionV3:
+		return videoRangeTokenDOVI
+	case playback.DynamicRangeHDR10PlusV3:
+		return videoRangeTokenHDR10Plus
+	case playback.DynamicRangeHLGV3:
+		return videoRangeTokenHLG
+	case playback.DynamicRangeHDR10V3:
+		return videoRangeTokenHDR10
+	case playback.DynamicRangeSDRV3:
+		return videoRangeTokenSDR
+	default:
+		// Unknown HDR (and any unrecognized label) stays unclassifiable; the
+		// file-level HDR flag carries the "unknown" grade.
+		return ""
+	}
+}
+
+// fillVirtualVideoTrackFromDescriptorV3 top-fills every gap in track from the
+// descriptor the running plan validated. It is the single field list shared by
+// the empty-track reconstruction and the existing-track top-up: a field the
+// planner reads is either filled from the descriptor here or deliberately
+// absent, never filled by one caller but not the other.
+//
+// A field that already carries a row value is left as-is; the carry only tops
+// up the unprobed metadata a fresh listing row dropped and never overwrites
+// evidence the row already has. The one deliberate exception is VideoCopyUnsafe,
+// an aggregated runtime verdict that propagates on the paths this function
+// handles — a partial or empty track — so a route the running plan disqualified
+// as copy-unsafe does not read copy-safe. A row whose video evidence is already
+// complete is returned untouched by the caller before this runs, so its own
+// recorded verdict stands.
+func fillVirtualVideoTrackFromDescriptorV3(track *models.VideoTrack, source playback.SourceDescriptorV3) {
+	if track == nil {
+		return
+	}
+	if track.Codec == "" {
+		track.Codec = source.VideoCodec
+	}
+	if track.Profile == "" {
+		track.Profile = source.VideoProfile
+	}
+	if track.Level == 0 {
+		track.Level = source.VideoLevel
+	}
+	if track.BitDepth == 0 {
+		track.BitDepth = source.BitDepth
+	}
+	if track.Width == 0 {
+		track.Width = source.Width
+	}
+	if track.Height == 0 {
+		track.Height = source.Height
+	}
+	if virtualFrameRateV3(track.FrameRate) <= 0 {
+		track.FrameRate = strconv.FormatFloat(source.FrameRate, 'f', -1, 64)
+	}
+	if track.Bitrate == 0 {
+		// VideoTrack.Bitrate is the probe's kbps figure (scanner/probe.go
+		// stores ffprobe bit_rate/1000), the same unit as
+		// SourceDescriptorV3.BitrateKbps, so the assignment is unit-preserving.
+		track.Bitrate = source.BitrateKbps
+	}
+	if strings.TrimSpace(track.ColorRange) == "" {
+		track.ColorRange = source.ColorRange
+	}
+	if !track.HDR10Plus {
+		track.HDR10Plus = source.HDR10Plus
+	}
+	if strings.TrimSpace(track.VideoRangeType) == "" {
+		track.VideoRangeType = virtualVideoRangeTypeFromDescriptorV3(source)
+	}
+	// A DV base-layer provenance without a profile is not a DV classification
+	// the route resolver can trust, so the whole DV block is gated on the
+	// descriptor naming a profile — the same fail-closed posture the previous
+	// reconstruction used. Within that, each sub-field is a gap fill.
+	if source.DVProfile > 0 {
+		if track.DVProfile == 0 {
+			track.DVProfile = source.DVProfile
+		}
+		if track.DVLevel == 0 {
+			track.DVLevel = source.DVLevel
+		}
+		if track.DVBLCompatID == 0 && !track.DVBLCompatIDPresent {
+			// Zero is a meaningful compatibility id — tonemap deliberately
+			// returns no safe base for it — so a row that already knows it is
+			// zero keeps it. Only a missing field may be filled: matching codecs
+			// alone does not establish that the row's profile and compatibility
+			// agree with the descriptor's.
+			track.DVBLCompatID = source.DVBLCompatID
+		}
+		// The descriptor carries a single aggregated base-layer provenance
+		// flag. Reproduce it only when it was proven; an unproven profile keeps
+		// the three presence booleans false so the route resolution fails
+		// closed instead of inventing a compatible base layer.
+		if source.DVBaseLayerProven {
+			track.DVConfigPresent = true
+			track.DVBLCompatIDPresent = true
+			track.DVBLPresent = true
+		}
+	}
+	if strings.TrimSpace(track.DVEnhancementLayer) == "" {
+		if layer := strings.TrimSpace(string(source.DVEnhancementLayer)); layer != "" {
+			track.DVEnhancementLayer = layer
+		}
+	}
+	if source.VideoCopyUnsafe {
+		track.VideoCopyUnsafe = true
+	}
+}
+
+// virtualFrameRateV3 parses a stored frame-rate string the same way the planner
+// does, without importing the playback parser into the handler: the "N/D" and
+// decimal forms both feed routeVideoMetadataCompleteV3, and a synthesized value
+// must round-trip through that parser.
+func virtualFrameRateV3(value string) float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if parts := strings.Split(value, "/"); len(parts) == 2 {
+		n, nErr := strconv.ParseFloat(parts[0], 64)
+		d, dErr := strconv.ParseFloat(parts[1], 64)
+		if nErr == nil && dErr == nil && d != 0 {
+			return n / d
+		}
+	}
+	v, _ := strconv.ParseFloat(value, 64)
+	return v
+}
+
 // sessionHasVirtualProvenanceV3 reports whether the session holds any provenance
 // describing its pinned virtual bytes: the probe-evidence flag, the evidence
 // URI, or the evidence row id. It says nothing about whether that provenance
@@ -11483,6 +12073,13 @@ var errSubtitleUnavailableInTargetV3 = errors.New("no equivalent subtitle track 
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) (bool, error) {
 	if request == nil || source == nil || target == nil {
+		return false, nil
+	}
+	// Explicit off (subtitle_track_index = -1) names no track, so there is
+	// nothing to remap and the intent must survive a version change: a client
+	// that asked for subtitles off stays off rather than having the negative
+	// sentinel reinterpreted against the target's inventory.
+	if request.SubtitleTrackIndex != nil && *request.SubtitleTrackIndex == playback.SubtitleTrackOffIndexV3 {
 		return false, nil
 	}
 	// A same-id pairing is only a no-op when the subtitle inventory is

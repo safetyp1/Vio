@@ -136,6 +136,7 @@ import { versionSortableFromFile } from "@/lib/qualityRanking";
 import {
   audioLanguageLabels,
   buildQualitySummary,
+  buildReleasePresentation,
   buildVersionDetailLine,
   profileLabelFromFilePath,
   subtitleLanguageLabels,
@@ -261,6 +262,19 @@ interface VideoPlayerProps {
   onConnectionLost?: (positionSeconds: number, resume: boolean) => void;
   /** Starts another reconnect after the session gave up. */
   onRetryConnection?: () => void;
+  /**
+   * A session-scoped call answered that the session is gone and there is no
+   * played stream for the reconnect to reposition, so the caller enters the
+   * lost state directly.
+   */
+  onSessionLost?: () => void;
+  /**
+   * A session-scoped call answered that the session is gone while a reconnect
+   * was already running. The reconnect is the recovery, but the server has
+   * confirmed the session it is rebuilding no longer exists, so run its next
+   * attempt now instead of waiting out the backoff.
+   */
+  onExpediteReconnect?: () => void;
   /** The session's mid-stream connection state. */
   connectionStatus?: PlaybackConnectionStatus;
   /** Why reconnecting gave up, while `connectionStatus` is `lost`. */
@@ -488,6 +502,8 @@ export function VideoPlayer({
   onPlanFailure,
   onConnectionLost,
   onRetryConnection,
+  onSessionLost,
+  onExpediteReconnect,
   connectionStatus = "connected",
   connectionErrorTitle = null,
   connectionError = null,
@@ -852,6 +868,55 @@ export function VideoPlayer({
   const reportConnectionLostRef = useRef(reportConnectionLost);
   reportConnectionLostRef.current = reportConnectionLost;
 
+  const onSessionLostRef = useRef(onSessionLost);
+  onSessionLostRef.current = onSessionLost;
+  const onExpediteReconnectRef = useRef(onExpediteReconnect);
+  onExpediteReconnectRef.current = onExpediteReconnect;
+
+  /**
+   * The progress sampler reports a session's disappearance and can answer that
+   * the session is gone in the same tick as a previous report. React batches
+   * the reconnect state change, so `connectionStatusRef` cannot separate them on
+   * its own: report a given session's disappearance once. A recovery re-arms it
+   * — a fresh `connected` status, or a newly adopted plan under the same session
+   * id (`planRevision`), since either proves the session is alive again and can
+   * drop later. A new session id re-arms it unconditionally: it is a different
+   * session whose disappearance must be reported even when the status never left
+   * `connected`.
+   */
+  const sessionGoneReportedRef = useRef(false);
+  useEffect(() => {
+    sessionGoneReportedRef.current = false;
+  }, [planRevision, sessionId]);
+  useEffect(() => {
+    if (connectionStatus === "connected") sessionGoneReportedRef.current = false;
+  }, [connectionStatus]);
+
+  /**
+   * A session-scoped call — the progress sampler's 404 — answered that the
+   * session no longer exists. Route it through the one recovery the player has
+   * — the reconnect restarts at the same position — and fall through to the
+   * lost state when nothing has played to reposition.
+   *
+   * The control lane no longer reports here: a control-ticket mint 404 is
+   * replica-local and cannot establish that playback ended, so it only degrades
+   * its own reconnect quietly (see `usePlaybackRealtime`).
+   *
+   * A reconnect may already be running from an earlier network drop. The
+   * server has now confirmed the session it is rebuilding is gone, so run its
+   * next attempt immediately instead of waiting out the backoff: the attempt
+   * that follows replaces the dead session with a fresh start.
+   */
+  const handleSessionGone = useCallback(() => {
+    if (sessionGoneReportedRef.current) return;
+    sessionGoneReportedRef.current = true;
+    if (reportConnectionLostRef.current()) {
+      if (connectionStatusRef.current === "reconnecting") onExpediteReconnectRef.current?.();
+      return;
+    }
+    onSessionLostRef.current?.();
+  }, []);
+
   // While the session reconnects, nothing plays: the element is paused (so
   // progress reports say so), and hls.js stops hammering the server. The
   // transport is rebuilt from the plan the reconnect adopts.
@@ -951,9 +1016,10 @@ export function VideoPlayer({
       versions.map((v) => {
         return {
           fileId: v.file_id,
-          // The shared one-line quality summary, identical to the item-page
-          // picker's for the same version fields.
-          label: buildQualitySummary(v),
+          // Scored release candidates lead with the Radarr-style release
+          // line; everything else keeps the shared one-line quality summary,
+          // identical to the item-page picker's for the same version fields.
+          label: buildReleasePresentation(v) || buildQualitySummary(v),
           releaseName: buildVersionDetailLine(v),
           // Same release + structured size + source hint the item-page picker
           // shows, so the two version menus stay equal in information.
@@ -1526,7 +1592,13 @@ export function VideoPlayer({
   useMediaSkipHandlers(displayMode !== "postroll", skipActions.back, skipActions.forward);
 
   // -- Watch progress reporting --
-  const flushWatchProgress = useWatchProgress(sessionId, videoRef, timelineOffsetRef);
+  const flushWatchProgress = useWatchProgress(
+    sessionId,
+    videoRef,
+    timelineOffsetRef,
+    handleSessionGone,
+    planRevision,
+  );
 
   const buildExitState = useCallback((): PlaybackExitState => {
     const video = videoRef.current;
@@ -2560,6 +2632,12 @@ export function VideoPlayer({
                   const retryAfter = manifestRetryAfterMs(data);
                   const instance = hls;
                   const manifestUrl = instance?.url ?? data.frag?.url ?? data.url;
+                  // A pollback is a manifest reload like any other: replace any
+                  // timer still pending so a superseded retry cannot fire a
+                  // second, overlapping loadSource.
+                  if (manifestPollbackRef.current !== undefined) {
+                    window.clearTimeout(manifestPollbackRef.current);
+                  }
                   const timer = window.setTimeout(() => {
                     if (destroyed) return;
                     if (hlsStartupGuardRef.current?.isStarting() !== true) return;
@@ -4458,6 +4536,7 @@ export function VideoPlayer({
     onCommand: executeRealtimeCommand,
     onEvent: handleRealtimeEvent,
     supportedCommands: VIDEO_PLAYBACK_COMMANDS,
+    recoveryRevision: planRevision,
   });
 
   useEffect(() => {

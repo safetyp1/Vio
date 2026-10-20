@@ -3077,6 +3077,11 @@ func TestValidateSeekReanchorPlanV3RejectsRouteDrift(t *testing.T) {
 			value.AppliedQuirks[0].Action = "disable-passthrough"
 		}},
 		{name: "effective version", mutate: func(value *playback.PlanV3) { value.EffectiveMediaFileID = 84 }},
+		{name: "effective virtual URI", mutate: func(value *playback.PlanV3) { value.EffectiveVirtualURI = "virtual://movie/x?result=b" }},
+		// Source substitution: every route field, track, and claim is unchanged,
+		// only the bytes the plan names differ. A seek reanchor replays the
+		// running plan, so this must be refused like any other route drift.
+		{name: "source descriptor", mutate: func(value *playback.PlanV3) { value.Source.BitDepth = 10 }},
 		{name: "track", mutate: func(value *playback.PlanV3) {
 			index := 1
 			value.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: playback.TrackIDV3(42, "audio", index), Index: &index}
@@ -3710,6 +3715,106 @@ func TestPrepareTransportV3CopyAnchorGenericFailureDoesNotBackOff(t *testing.T) 
 	}
 	if transportErr == nil || transportErr.reason != "transcode_start_failed" || !transportErr.retryable {
 		t.Fatalf("transport error = %#v, want the retryable terminal unchanged", transportErr)
+	}
+}
+
+// TestPrepareTransportV3CopyAnchorRetriesAfterExternalKill proves the live
+// production failure is bounded-recoverable: the first probe process is
+// SIGKILLed from outside (the OOM killer or an operator), which is not a verdict
+// about the release, so the transient classification triggers exactly one retry
+// and the second, healthy probe completes the start.
+func TestPrepareTransportV3CopyAnchorRetriesAfterExternalKill(t *testing.T) {
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	firstProbePath := filepath.Join(dir, "first-probe-done")
+	probe := `#!/bin/sh
+if [ ! -f "` + firstProbePath + `" ]; then
+  printf x > "` + firstProbePath + `"
+  kill -9 $$
+fi
+printf '%s\n' '#tb 0: 1/1000'
+printf '%s\n' '0,      118000,      120000,       41,   178989, 0xd16e41c4'
+`
+	if err := os.WriteFile(ffmpegPath, []byte(probe), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	probeCalls := 0
+	handler.copySeekAnchor = func(ctx context.Context, _ string, inputPath string, requested float64, segmentDuration int) (float64, int, error) {
+		probeCalls++
+		return playback.ResolveCopySeekAnchor(ctx, ffmpegPath, inputPath, requested, segmentDuration)
+	}
+	backoffCalls := 0
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool {
+		backoffCalls++
+		return true
+	}
+	plan := &playback.PlanV3{
+		PlanID:               "plan:copy-external-kill",
+		Delivery:             playback.DeliveryRemuxProgressiveV3,
+		EffectiveMediaFileID: 42,
+		Timeline:             playback.TimelineV3{SourceStartSeconds: 120, PlayerStartSeconds: 120, CanSeekAnywhere: true, SeekRestoration: "player_position"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	defer cancel()
+	transport, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-external-kill", UserID: 7, ProfileID: "profile-1", MediaFileID: 42, PlayMethod: playback.PlayRemux, BasePlayMethod: playback.PlayRemux},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if transportErr != nil {
+		t.Fatalf("prepare transport after an external kill: %v", transportErr)
+	}
+	defer transport.rollback()
+	if probeCalls != 2 {
+		t.Fatalf("copy anchor probes = %d, want 2 (one bounded retry after the kill)", probeCalls)
+	}
+	if backoffCalls != 1 {
+		t.Fatalf("backoffs = %d, want exactly 1 before the retry", backoffCalls)
+	}
+	if firstProbe, err := os.ReadFile(firstProbePath); err != nil || string(firstProbe) != "x" {
+		t.Fatalf("first probe marker = %q, %v; want the killed first attempt", firstProbe, err)
+	}
+}
+
+// TestPrepareTransportV3CopyAnchorCallerCanceledProbeIsNotRetried pins that a
+// caller cancellation stays distinct from a transient probe failure: even when
+// the probe reports the transient class, the loop must observe the canceled
+// caller context and return instead of spending the bounded retry on a request
+// nobody is waiting for.
+func TestPrepareTransportV3CopyAnchorCallerCanceledProbeIsNotRetried(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probeCalls := 0
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		probeCalls++
+		cancel()
+		return 0, 0, fmt.Errorf("%w: exit status 137 (stderr: signal: killed)", playback.ErrTransientProvider)
+	}
+	backoffCalls := 0
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool {
+		backoffCalls++
+		return true
+	}
+	plan := &playback.PlanV3{PlanID: "plan:copy-caller-canceled", Delivery: playback.DeliveryRemuxHLSV3, Timeline: playback.TimelineV3{SourceStartSeconds: 120}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	_, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-caller-canceled"},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if probeCalls != 1 {
+		t.Fatalf("copy anchor probes = %d, want exactly 1 after caller cancellation", probeCalls)
+	}
+	if backoffCalls != 0 {
+		t.Fatalf("backoffs = %d, want 0 for a canceled caller", backoffCalls)
+	}
+	if transportErr == nil || transportErr.reason != "transcode_start_failed" {
+		t.Fatalf("transport error = %#v, want the canceled start to return", transportErr)
 	}
 }
 
@@ -4744,14 +4849,28 @@ func TestRouteEventV3AcceptsAndroidSeekEvents(t *testing.T) {
 	}
 }
 
-func TestRemapSubtitleSelectionV3RejectsNegativeIndex(t *testing.T) {
-	index := -1
-	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
+// TestRemapSubtitleSelectionV3PreservesExplicitOff pins that the explicit-off
+// sentinel survives a version change untouched: -1 names no track, so there is
+// nothing to remap and it must not be reinterpreted against the target's
+// inventory. A value below the sentinel stays invalid.
+func TestRemapSubtitleSelectionV3PreservesExplicitOff(t *testing.T) {
+	off := playback.SubtitleTrackOffIndexV3
+	request := playback.StartRequestV3{SubtitleTrackIndex: &off}
 	source := &models.MediaFile{ID: 1, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	target := &models.MediaFile{ID: 2, ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}}}
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	dropped, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request)
+	if err != nil || dropped {
+		t.Fatalf("explicit off remap = (dropped=%v, err=%v), want it preserved", dropped, err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != playback.SubtitleTrackOffIndexV3 {
+		t.Fatalf("explicit off remap mutated the selection to %v", request.SubtitleTrackIndex)
+	}
+
+	invalid := playback.SubtitleTrackOffIndexV3 - 1
+	request = playback.StartRequestV3{SubtitleTrackIndex: &invalid}
 	if _, err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err == nil {
-		t.Fatal("negative subtitle index was accepted")
+		t.Fatal("subtitle index below the off sentinel was accepted")
 	}
 }
 

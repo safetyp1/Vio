@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -49,6 +51,175 @@ func refreshTestDetail() *catalog.WatchDetail {
 		FileID: 7, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
 		AddedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}}}
+}
+
+func TestVirtualCandidatesDiscoveryUsesCacheAndPreservesFailures(t *testing.T) {
+	for _, kind := range []string{"movie", "episode", "series"} {
+		for _, unavailable := range []bool{false, true} {
+			listed, persisted := 0, 0
+			detail := refreshTestDetail()
+			detail.Type = kind
+			service := &VirtualCandidatesRefreshService{
+				Detail: &fakeRefreshDetail{detail: detail},
+				ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					listed++
+					if unavailable {
+						return nil, errors.New("provider unavailable")
+					}
+					return []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}, nil
+				}),
+				ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+					t.Fatal("discovery forced a provider refresh")
+					return nil, nil
+				}),
+				ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+					return []*models.MediaFile{refreshTestSource(7, "movie:x", "virtual://movie/x")}, nil
+				},
+				Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+					persisted++
+					return nil
+				},
+			}
+			_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+			if kind == "series" {
+				if err == nil || listed != 0 || persisted != 0 {
+					t.Fatalf("whole series discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+				}
+			} else if unavailable {
+				if err == nil || listed != 1 || persisted != 0 {
+					t.Fatalf("failed discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+				}
+			} else if err != nil || listed != 1 || persisted != 1 {
+				t.Fatalf("discovery: err=%v listed=%d persisted=%d", err, listed, persisted)
+			}
+		}
+	}
+}
+
+// TestVirtualCandidatesDiscoveryEmptyListingIsEmptySuccess proves a provider
+// answer with zero candidates is a valid empty discovery, not a dependency
+// failure: it succeeds with an empty result and leaves stored rows untouched.
+func TestVirtualCandidatesDiscoveryEmptyListingIsEmptySuccess(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	persisted := 0
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	detailReader := &fakeRefreshDetail{detail: detail}
+	service := &VirtualCandidatesRefreshService{
+		Detail: detailReader,
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{}, nil
+		}),
+		ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			t.Fatal("discovery forced a provider refresh")
+			return nil, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			persisted++
+			return nil
+		},
+	}
+	service.ScheduleDefaultFileProbe = func(string, *models.MediaFile, []VirtualPlaybackStream, catalog.AccessFilter) {
+		t.Fatal("an empty listing must not schedule a pre-play probe chain")
+	}
+	versions, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("empty listing must not be a discovery failure: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("versions = %+v, want the provider's empty result", versions)
+	}
+	if persisted != 0 {
+		t.Fatalf("persist calls = %d, want 0 on an empty listing", persisted)
+	}
+	if detailReader.calls != 1 {
+		t.Fatalf("detail reads = %d, want only the pre-discovery read", detailReader.calls)
+	}
+}
+
+// TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist pins the ordering
+// the pre-play probe chain depends on: a non-empty discovery persists the
+// listing first and schedules the chain from inside the shared work afterwards.
+func TestVirtualCandidatesDiscoverySchedulesProbeAfterPersist(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	streams := []VirtualPlaybackStream{{ID: "candidate", URI: "virtual://movie/x?result=candidate"}}
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	var order []string
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return streams, nil
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(_ context.Context, got *models.MediaFile, _ []VirtualPlaybackStream) error {
+			if got == nil || got.ID != source.ID {
+				t.Fatalf("persist source = %+v, want %+v", got, source)
+			}
+			order = append(order, "persist")
+			return nil
+		},
+	}
+	service.ScheduleDefaultFileProbe = func(contentID string, got *models.MediaFile, gotStreams []VirtualPlaybackStream, gotFilter catalog.AccessFilter) {
+		order = append(order, "schedule")
+		if contentID != "movie:x" {
+			t.Fatalf("probe chain content = %q, want movie:x", contentID)
+		}
+		if got == nil || got.ID != source.ID {
+			t.Fatalf("probe chain source = %+v, want %+v", got, source)
+		}
+		if len(gotStreams) != len(streams) || gotStreams[0].URI != streams[0].URI {
+			t.Fatalf("probe chain streams = %+v, want the persisted listing", gotStreams)
+		}
+		if !slices.Equal(gotFilter.AllowedLibraryIDs, []int{42}) || gotFilter.MaxContentRating != "PG-13" {
+			t.Fatalf("probe chain filter = %+v, want the discovery request's filter", gotFilter)
+		}
+	}
+	filter := catalog.AccessFilter{AllowedLibraryIDs: []int{42}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG-13"}}
+	if _, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", filter); err != nil {
+		t.Fatalf("discovery: %v", err)
+	}
+	if len(order) != 2 || order[0] != "persist" || order[1] != "schedule" {
+		t.Fatalf("discovery order = %v, want [persist schedule]", order)
+	}
+}
+
+// TestVirtualCandidatesDiscoveryProviderFailureStaysRetryable proves genuine
+// provider failure still maps to the retryable 503, unlike an empty listing.
+func TestVirtualCandidatesDiscoveryProviderFailureStaysRetryable(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	persisted := 0
+	detail := refreshTestDetail()
+	detail.Type = "movie"
+	service := &VirtualCandidatesRefreshService{
+		Detail: &fakeRefreshDetail{detail: detail},
+		ListCached: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("provider offline")
+		}),
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			persisted++
+			return nil
+		},
+	}
+	_, err := service.DiscoverVirtualCandidates(context.Background(), 1, "profile", "movie:x", catalog.AccessFilter{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != "unavailable" {
+		t.Fatalf("err = %v, want a retryable 503 APIError", err)
+	}
+	if !strings.Contains(apiErr.Message, "could not be reached") {
+		t.Fatalf("message = %q, want the provider-reachability answer", apiErr.Message)
+	}
+	if persisted != 0 {
+		t.Fatalf("persist calls = %d, want 0 on provider failure", persisted)
+	}
 }
 
 // TestVirtualCandidatesRefreshServiceRefreshesAndReturnsList covers the happy

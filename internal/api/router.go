@@ -1125,7 +1125,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	// collage of their titles; it needs artwork storage and poster signing.
 	var personalCollages *catalog.PersonalCollectionCollages
 	if deps.DB != nil && detailSvc != nil {
-		if gen := handlers.NewPersonalCollectionCollageGenerator(deps.Blobs.Assets, detailSvc, nil); gen != nil {
+		if gen := handlers.NewPersonalCollectionCollageGenerator(deps.Blobs.Assets, detailSvc, deps.ArtworkSigner, deps.ArtworkRepair, nil); gen != nil {
 			personalCollages = deps.PersonalCollectionCollages
 			if personalCollages == nil {
 				personalCollages = catalog.NewPersonalCollectionCollages(deps.DB, nil)
@@ -1419,6 +1419,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				// access-checked detail read.
 				if itemsHandler != nil {
 					virtualCandidatesRefresh = &handlers.VirtualCandidatesRefreshService{
+						ListCached: playbackHandler.VirtualPlaybackStreamLister,
 						ListFresh: handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
 							// Explicit user refresh: a provider list does run,
 							// so the fetch log is correlated like the start
@@ -1433,6 +1434,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 						ContentFiles: deps.FileRepo.GetByContentID,
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
+					}
+					// The discovery path schedules the pre-play probe chain
+					// after a successful detached persistence. Both sides stay
+					// decoupled: the service knows only the callback, the
+					// handler resolves its own target through the catalog's
+					// version ordering (the same top entry the browse picker
+					// defaults to) under the discovery request's access filter,
+					// and the file repository.
+					if detailSvc != nil && deps.FileRepo != nil {
+						virtualCandidatesRefresh.ScheduleDefaultFileProbe = playbackHandler.ScheduleDefaultFileProbe
+						playbackHandler.DefaultProbeTarget = handlers.NewVirtualDefaultProbeTarget(detailSvc, deps.FileRepo)
 					}
 					// The indexer-release read/request surface and the async
 					// refresh executor share the store the service owns.
@@ -1776,7 +1788,19 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.Config != nil {
 			ffprobePath := scanner.FFprobePathFromFFmpeg(deps.Config.Playback.FFmpegPath)
-			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
+			// The ffprobe evidence cache TTL is the admin Streaming setting
+			// virtual_library.playback_probe_cache_minutes. Unset or
+			// unreadable keeps the ten minutes the cache shipped with. It does
+			// not share virtual_library.cache_ttl_minutes with the provider
+			// listing cache; that key governs listing reuse only. The cache
+			// is built once per boot, so changes apply after a restart.
+			probeCacheTTL := time.Duration(config.DefaultVirtualLibraryPlaybackProbeCacheMinutes) * time.Minute
+			if settingsRepo != nil {
+				if raw, err := settingsRepo.Get(context.Background(), config.VirtualLibraryPlaybackProbeCacheMinutesSettingKey); err == nil {
+					probeCacheTTL = time.Duration(config.VirtualLibraryPlaybackProbeCacheMinutes(raw)) * time.Minute
+				}
+			}
+			virtualProbeCache := scanner.NewVirtualProbeCache(probeCacheTTL, 256)
 			virtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
 				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
 					// Keep ffprobe behind the same pinned-IP relay as playback. A
@@ -2782,6 +2806,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 		)
 		libraryCollectionHandler.ArtworkStore = deps.Blobs.Assets
 		libraryCollectionHandler.ArtworkResolver = deps.ArtworkResolver
+		libraryCollectionHandler.ArtworkSigner = deps.ArtworkSigner
+		libraryCollectionHandler.ArtworkRepair = deps.ArtworkRepair
 		libraryCollectionHandler.FrontendFS = deps.FrontendFS
 		libraryCollectionHandler.Executor = &catalog.QueryExecutor{Pool: deps.DB}
 		libraryCollectionHandler.SectionRepo = sectionRepo
@@ -3309,6 +3335,26 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if virtualRefreshJobs != nil {
 		v2deps.VirtualCandidatesRefresh = virtualRefreshJobs
+	}
+	if virtualCandidatesRefresh != nil && settingsRepo != nil {
+		v2deps.VirtualCandidatesDiscovery = virtualCandidatesRefresh
+		v2deps.PreplayDiscoveryEnabled = func(ctx context.Context) bool {
+			enabled, err := settingsRepo.Get(ctx, "virtual_library.discover_before_playback")
+			if err != nil || enabled != "true" {
+				return false
+			}
+			streaming, err := settingsRepo.Get(ctx, "virtual_library.enabled")
+			return err == nil && streaming != "false"
+		}
+		// The catalog leaf detail read prices its wait on this setting; unset
+		// or unreadable keeps apiv2's built-in default.
+		v2deps.PreplayDiscoveryBudgetMs = func(ctx context.Context) int {
+			raw, err := settingsRepo.Get(ctx, config.VirtualLibraryCatalogDiscoveryBudgetMsSettingKey)
+			if err != nil {
+				return 0
+			}
+			return config.VirtualLibraryCatalogDiscoveryBudgetMs(raw)
+		}
 	}
 	if virtualIndexerReleases != nil {
 		v2deps.VirtualReleaseRequest = virtualIndexerReleases

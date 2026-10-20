@@ -88,6 +88,49 @@ func mediaCandidatesDeps(refresh *fakeVirtualCandidatesRefresh) Dependencies {
 	return deps
 }
 
+func (f *fakeVirtualCandidatesRefresh) DiscoverVirtualCandidates(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter) ([]catalogpkg.FileVersion, error) {
+	f.calls++
+	f.userID, f.profileID, f.contentID = userID, profileID, contentID
+	return nil, f.err
+}
+
+func (f *fakeVirtualCandidatesRefresh) HasVirtualSource(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
+func TestDiscoverVirtualCandidatesSettingAndAccess(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		discovery := &fakeVirtualCandidatesRefresh{}
+		deps := mediaCandidatesDeps(discovery)
+		deps.VirtualCandidatesDiscovery = discovery
+		deps.PreplayDiscoveryEnabled = func(context.Context) bool { return enabled }
+		handler := newTestHandler(t, deps)
+		endpoint := "/api/v2/media/movie:heat-1995/virtual-candidates:discover"
+		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", nil), TypeAuthenticationRequired)
+		if discovery.calls != 0 {
+			t.Fatal("unauthenticated discovery reached the service")
+		}
+		owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+		response := do(t, handler, http.MethodPost, endpoint, "", owner)
+		if !enabled {
+			requireProblem(t, response, TypeDependencyUnavailable)
+			if discovery.calls != 0 {
+				t.Fatal("disabled discovery reached the service")
+			}
+			continue
+		}
+		if response.Code != http.StatusNoContent || discovery.calls != 1 || discovery.userID != 1 || discovery.profileID != "p-owner" || discovery.contentID != "movie:heat-1995" {
+			t.Fatalf("status=%d discovery=%+v", response.Code, discovery)
+		}
+		// An empty candidate list is a successful discovery (the fake returns
+		// nil versions); provider unavailability stays a retryable 503.
+		discovery.err = &handlers.APIError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The provider could not be reached; try again."}
+		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", owner), TypeDependencyUnavailable)
+		discovery.err = &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Watch target not found"}
+		requireProblem(t, do(t, handler, http.MethodPost, endpoint, "", owner), TypeNotFound)
+	}
+}
+
 func TestRefreshVirtualCandidatesAcceptsJob(t *testing.T) {
 	refresh := &fakeVirtualCandidatesRefresh{}
 	h := newTestHandler(t, mediaCandidatesDeps(refresh))

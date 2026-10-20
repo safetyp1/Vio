@@ -86,7 +86,13 @@ selection intent against it (the same default-audio reconciliation the
 non-deferred evidence path runs) and asks the client to replan through the
 existing `plan_invalidated` handshake, so the executable recipe keeps the
 preferred language. An explicit viewer selection is verified present and never
-overridden.
+overridden. A selection that is genuinely absent from the committed inventory is
+never substituted: the verifier records an `AudioReconcileRefused` ledger entry
+and warns, and a virtual remux start answers a retryable
+`409 audio_selection_invalid` for the client to replan from, with no route event
+ending the session. The refusal entry and the transport's invalid-selection flag
+are independent: the overlay remap sets that flag on its own, and only while the
+committed index is still in range.
 `tracks_pending` is a menu hint and is excluded from plan identity, so an
 idempotent start retry replays the same plan with the same marker.
 
@@ -158,7 +164,100 @@ malformed id is `422`; an unconfigured provider is `503`.
 when either path is wired and `not_configured` otherwise. `indexer_search`
 reports whether Prowlarr search is configured and `indexer_request` whether
 provider enqueue is configured; clients that cannot request releases must not
-offer the action.
+offer the action. `discover_before_playback` reports whether opt-in pre-play
+version discovery is enabled and wired; it also makes `state` available.
+
+### Pre-play Discovery
+
+`virtual_library.discover_before_playback` is a server-wide streaming setting,
+defaulting to `false`. The capability and discovery operation read it on each
+request, so saving the setting does not require a restart.
+
+When enabled, the web detail page calls
+`POST /api/v2/media/{media_id}/virtual-candidates:discover` for the selected
+virtual movie or episode, without waiting for Play. The operation enforces the
+same account/profile access filter as watch detail. It reuses the provider
+candidate cache, coalesces concurrent discovery of the same source, persists
+non-empty listings, and answers `204 No Content`. A provider listing that
+succeeds with no candidates is a valid empty discovery: it answers `204`,
+persists nothing, and leaves stored candidates intact. A disabled or unwired
+service answers `503`; a whole-series or non-virtual target answers `422`.
+Provider unavailability and timeouts answer `503` and leave existing candidates
+intact. The explicit Refresh List action stays available as the retry path.
+
+Discovery does not request downloads, search indexers, or open media URLs.
+After success, clients reload item and watch detail to display the persisted
+versions. Play remains available during discovery, and playback-time resolution
+remains the fallback. The web client initiates discovery only for detail views,
+not list cards or whole seasons/series, and reuses a recent discovery for 30
+seconds. Native clients and Jellyfin clients keep their existing playback-time
+behavior when the setting is off.
+
+When enabled, `GET /api/v2/watch/{id}` also discovers versions after checking
+access for a virtual movie or individual episode. It uses the same cached
+discovery service and re-reads watch detail before answering, so existing
+native clients receive the persisted versions without calling the
+discovery operation themselves. Discovery has a 15-second waiting budget.
+On failure, the original detail is returned; shared provider work may finish
+after that wait and be visible on a later request.
+
+When enabled, a leaf catalog detail read — `GET /api/v2/catalog/items/{id}`
+resolving to a virtual movie or individual episode — runs the same discovery
+and re-reads the item detail before answering, under a 3-second waiting
+budget: browsing is the hot path and native clients such as Android read item
+detail alone before play. Shared provider work keeps running detached from
+the request, so a listing that finishes after the budget is visible on a
+later read. Discovery failure, a timeout, or a failed detail re-read returns
+the original detail. Eligibility reads the stored source rows and never the
+response's redacted file paths, so viewers without file-path visibility reach
+the same discovery.
+
+The catalog wait is tuned with the admin Streaming setting
+`virtual_library.catalog_discovery_budget_ms` (500-10000, default 3000). It
+is read on each detail request, so saving it does not require a restart.
+Measured provider scrapes vary from tens of milliseconds to about 2.5s, and
+the built-in default absorbs the wall-clocked overhead the scrape accrues
+before persistence; the watch path keeps its full 15-second budget.
+
+Leaf answers carry an additive `has_virtual_source` boolean. It reports
+whether the item holds persisted virtual candidate groups, read from the same
+stored rows discovery uses, and it exists independently of whether discovery
+is enabled or its budget expired — a viewer whose file paths are redacted
+still learns whether the item's source rows live on the provider. The field
+does not promise additional playable versions beyond what the versions
+fields list, and `true` is its only rendered value: local items, non-leaf
+items (series, season, lists), and failed lookups leave the field out. It
+appears on `GET /api/v2/catalog/items/{id}`, `GET /api/v2/watch/{id}`, and
+the admin metadata update response, keeping v1 answers byte-identical.
+
+After discovery persists a listing, the server schedules one detached
+pre-play probe chain for the opened item: it re-reads the item's default
+version, requires that the default row is a persisted candidate whose exact
+bytes the just-persisted listing names, and probes that candidate through
+the ordinary background evidence path (queued, coalescing write). A neutral
+group row is never probed speculatively — it may resolve to a sibling
+candidate, so the play path's own probe handles it. Chains are bounded (two
+concurrent, one per item, a whole-chain deadline, and the shared probe
+gate), never block any API response, and never gate or delay playback: a
+chain may record evidence before a play attempt resolves the same row, in
+which case that attempt reuses it, and a play attempt that resolves first
+probes on its own as usual. The queued evidence write follows the existing
+persistence rules, including their stale-write protections; probing
+failures arm the same failure damper the playback path uses, an
+already-stamped row is skipped, and every unexpected chain failure —
+including a panic — is contained to the chain.
+
+Local-file details, version-only routes, browse results, and series, season,
+and episode lists — including `GET /api/v2/catalog/items/{id}/versions`,
+`/episodes`, and the series season endpoints — still never initiate discovery.
+A view served entirely from the client's cache cannot. This does not add a
+Jellyfin-protocol trigger.
+
+Server logs identify these paths with `pre-play version discovery started`,
+`pre-play version discovery completed`, or `pre-play version discovery unavailable`
+and `trigger=watch_detail` (watch detail) or `trigger=catalog_detail`
+(catalog leaf detail). A successful discovery
+followed by a failed detail re-read logs `pre-play version discovery detail reload failed`.
 
 ### Refresh List
 
@@ -252,6 +351,17 @@ with `outcome: "adaptation_unavailable"`, `terminal.reason: "session_expired"`
 and `terminal.retryable: true`; mint a new attempt. Local direct and HLS media
 URLs in the plan are projected into the `/api/v2` namespace; the signed `st`
 query they carry is unchanged.
+
+When the profile's stored `playback.subtitle_mode` is `always`, an omitted
+`subtitle_track_id` / `subtitle_track_index` on start resolves to the stored
+preference's track before planning, so subtitles are on — and a bitmap track
+forces the burn-in video codec — on the first plan rather than after a
+reconciliation replan. `subtitle_track_index: -1` is the explicit-off encoding:
+it requests a one-off subtitle-free start without changing the stored mode, and
+overrides `always`. Omission (the field absent) remains "no selection intent"
+and is never read as off; a named track is never overridden; a stored mode other
+than `always` (including the off state) leaves the selection to the client on
+omission.
 
 A start that returns a playable decision registers the device the client
 declares in `X-Silo-Device-Id` (with the optional `X-Silo-Device-Name` and

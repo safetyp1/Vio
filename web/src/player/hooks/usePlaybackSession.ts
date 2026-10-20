@@ -351,7 +351,10 @@ function identityMatchesPlan(identity: SourceIdentity, plan: PlanV3): boolean {
   if (identity.uri != null) {
     if (plan.effective_virtual_uri == null) return false;
     if (identity.uri !== plan.effective_virtual_uri) return false;
-    if (identity.fileId != null && identity.fileId !== plan.effective_media_file_id) return false;
+    // The concrete candidate is the release identity. A catalog row id can
+    // move under it (duplicate rows, the owner row materializing, a serve-layer
+    // association); that is not a different source for the menu, so the plan's
+    // row id must not veto the payload. The fold adopts the payload's row.
     return true;
   }
   // A file-only push cannot be tied to a candidate when the plan names one.
@@ -389,6 +392,22 @@ function planWasReplaced(arrivalPlan: PlanV3 | null, plan: PlanV3): boolean {
 function identityNamesSameSource(a: SourceIdentity, b: SourceIdentity): boolean {
   if (a.uri != null || b.uri != null) return a.uri === b.uri;
   return a.fileId != null && a.fileId === b.fileId;
+}
+
+/**
+ * Whether two identities name one concrete candidate even when their catalog
+ * row ids differ.
+ *
+ * The provider-neutral candidate URI (including the `?result=` pick) is the
+ * release identity. One release can have several catalog rows: an owner row
+ * that materializes later, duplicate rows imported for the same path, or the
+ * row a serve-layer association moves the session onto. A push that keeps the
+ * candidate and only moves the row is the same source for the menus, so the
+ * stale-delivery guards must compare the URI first and adopt the payload's row
+ * instead of dropping the revision.
+ */
+function identityNamesSameCandidate(a: SourceIdentity, b: SourceIdentity): boolean {
+  return a.uri != null && b.uri != null && a.uri === b.uri;
 }
 
 /**
@@ -577,6 +596,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** Starts a fresh reconnect cycle after the previous one gave up. */
   retryConnection: () => void;
   /**
+   * Runs the reconnect's next attempt immediately when a session-scoped call
+   * confirmed the session it is rebuilding is gone. No-op unless a reconnect
+   * is active with its backoff timer armed.
+   */
+  expediteReconnect: () => void;
+  /**
+   * Enters the lost state for a session the server no longer has when the
+   * reconnect cannot run (no played stream to reposition).
+   */
+  reportSessionLost: () => void;
+  /**
    * `failure_recovery` replan for a plan the *server* invalidated over the
    * realtime `plan_invalidated` command. Resolves to whether a replacement plan
    * is now playing; the caller reports that back as the command's result.
@@ -649,8 +679,21 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /**
    * Marks deferred discovery exhausted after polling attempts or deadline
    * time out, stopping the spinner and rendering an actionable failure state.
+   * Only a still-declared menu is marked; a confident inventory instead clears
+   * the pending flag, since no round is scheduled after exhaustion. A call that
+   * names another `sessionId`/`mediaFileId` than the live session is a stale
+   * timer and is ignored.
    */
-  markInventoryExhausted: () => void;
+  markInventoryExhausted: (expected?: {
+    sessionId?: string | null;
+    mediaFileId?: number | null;
+  }) => void;
+  /**
+   * Clears a terminal discovery-failure marker when a fresh poll round takes
+   * over, so the menus show "Discovering…" while a fallback is retrying rather
+   * than a terminal notice beside an active retry.
+   */
+  markInventoryRetrying: () => void;
   /**
    * Reads the session's live inventory from the plan's `inventory_url` with the
    * folded revision as ETag. A 200 folds the verified (or failed) list through
@@ -917,6 +960,10 @@ function describePlaybackSessionError(
   };
 }
 
+// Stable empty reference: consumers key effects on the variants array, so a
+// fresh `[]` default on every call would restart them.
+const EMPTY_PLAYBACK_VARIANTS: PlayerPlaybackVariant[] = [];
+
 /**
  * Owns the v3 playback session: the start decision, the plan it produced, and
  * every replan that supersedes it.
@@ -930,7 +977,7 @@ function describePlaybackSessionError(
 export function usePlaybackSession(
   requestKey: string,
   versions: PlayerFileVersion[],
-  playbackVariants: PlayerPlaybackVariant[] = [],
+  playbackVariants: PlayerPlaybackVariant[] = EMPTY_PLAYBACK_VARIANTS,
   fileId?: number,
   initialPosition = 0,
   forceInitialPosition = false,
@@ -1242,9 +1289,15 @@ export function usePlaybackSession(
       identityTransitionClockRef.current += 1;
       // A source rotation moves where the stream actually is; verified evidence
       // bound to the previous file/URI must not suppress inventory updates for
-      // the new one.
+      // the new one. A row-only move (same concrete candidate URI, a new
+      // catalog row for it) is not a rotation: the verified menu still
+      // describes the source on screen, so keep the anchor and let the fold
+      // adopt the new row without re-marking the menus provisional.
       if (changed) {
-        lastVerifiedIdentityRef.current = null;
+        const rowOnlySameCandidate = previous.uri != null && uri != null && previous.uri === uri;
+        if (!rowOnlySameCandidate) {
+          lastVerifiedIdentityRef.current = null;
+        }
       }
       return changed;
     },
@@ -2728,6 +2781,44 @@ export function usePlaybackSession(
     beginReconnect(reconnect.positionSeconds, reconnect.resume, true);
   }, [beginReconnect]);
 
+  /**
+   * A session-scoped call confirmed the session the reconnect is rebuilding is
+   * gone. The reconnect replaces a dead session with a fresh start, so run its
+   * pending attempt now rather than letting the viewer wait out the backoff.
+   * Only a timer-armed cycle is nudged: an attempt already in flight is
+   * already doing the work, and there is nothing to hurry.
+   */
+  const expediteReconnect = useCallback(() => {
+    const reconnect = reconnectRef.current;
+    if (reconnect.active && reconnect.timer !== null) scheduleReconnectAttempt(0);
+  }, [scheduleReconnectAttempt]);
+
+  /**
+   * Enters the lost state for a session the server has already answered that
+   * it no longer has, when the reconnect cannot run (nothing has played yet,
+   * so there is no position or transport to rebuild). Whenever a played stream
+   * exists, the reconnect is the one recovery and runs instead.
+   */
+  const reportSessionLost = useCallback(() => {
+    // Nothing played before the session was answered gone, so no reconnect
+    // cycle recorded where the viewer asked to start. Carry where playback was
+    // actually set to start and the adopted plan's play intent, so Retry
+    // rebuilds the session there instead of at zero or at a stale cycle's
+    // position. An adopted plan owns the server-resolved source position; only
+    // an explicit start (forceStartPosition) keeps the request's own position.
+    // Before any plan is adopted `playbackPositionRef` reflects the last known
+    // source position — the request's until a player update or a re-anchor
+    // moves it — so it is not necessarily the request position.
+    const reconnect = reconnectRef.current;
+    const startIntent = startIntentRef.current;
+    const resumeFromAdoptedPlan = hasAdoptedPlanRef.current && !startIntent.forceStartPosition;
+    reconnect.positionSeconds = resumeFromAdoptedPlan
+      ? playbackPositionRef.current
+      : startIntent.position;
+    reconnect.resume = planAutoPlayRef.current;
+    giveUpReconnect(CONNECTION_LOST_ERROR);
+  }, [giveUpReconnect]);
+
   // Coming back online is the best moment to try again.
   const reconnecting = state.connectionStatus === "reconnecting";
   useEffect(() => {
@@ -2997,13 +3088,23 @@ export function usePlaybackSession(
         // its confident marker in place; re-marking it would flap the menus
         // disabled/enabled on every interleaved declared delivery.
         const verified = source.inventoryStatus === "verified";
+        // A verified menu belongs to the candidate, not to the catalog row the
+        // plan happened to name. An owner row materializing, or a duplicate row
+        // being adopted, moves the file id but not the source; a declared push
+        // under that row must not re-mark the verified menu as provisional.
         const sameVerifiedSource =
-          !identityChanged &&
           verifiedAnchor !== null &&
-          verifiedAnchor.fileId === nextFileId &&
-          (verifiedAnchor.uri ?? null) === (nextUri ?? null);
+          (verifiedAnchor.uri != null || nextUri != null
+            ? verifiedAnchor.uri === nextUri
+            : !identityChanged && verifiedAnchor.fileId === nextFileId);
         const declaredDowngrade = !verified && source.inventoryStatus != null && sameVerifiedSource;
-        if (declaredDowngrade) return current;
+        if (declaredDowngrade) {
+          // Keep the verified list and its confident marker, but adopt the
+          // row id the delivery names so later subtitle URLs and pushes key on
+          // the source the session actually serves.
+          if (!identityChanged) return current;
+          return { ...current, mediaFileId: nextFileId, effectiveVirtualUri: nextUri };
+        }
         const provisional =
           source.inventoryStatus == null ? current.audioInventoryProvisional : !verified;
         const richer = audioTracks.length > current.planAudioTracks.length;
@@ -3103,10 +3204,19 @@ export function usePlaybackSession(
       const currentState = stateRef.current;
       const liveIdentity = menuIdentityRef.current;
       if (switchingRef.current || replanInFlightRef.current || currentState.replacing) {
+        const sameCandidate = identityNamesSameCandidate(
+          {
+            fileId: source.effectiveMediaFileId ?? null,
+            uri: source.effectiveVirtualUri ?? null,
+          },
+          liveIdentity,
+        );
         const movedSource =
-          (source.effectiveMediaFileId != null &&
+          !sameCandidate &&
+          ((source.effectiveMediaFileId != null &&
             source.effectiveMediaFileId !== liveIdentity.fileId) ||
-          (source.effectiveVirtualUri != null && source.effectiveVirtualUri !== liveIdentity.uri);
+            (source.effectiveVirtualUri != null &&
+              source.effectiveVirtualUri !== liveIdentity.uri));
         if (movedSource) pendingSwitchPositionRef.current = null;
         captureDeferredPush({
           kind: "source",
@@ -3163,8 +3273,9 @@ export function usePlaybackSession(
       const verifiedAnchor = lastVerifiedIdentityRef.current;
       const sameVerifiedSource =
         verifiedAnchor !== null &&
-        verifiedAnchor.fileId === effectiveFileId &&
-        (verifiedAnchor.uri ?? null) === (effectiveVirtualUri ?? null);
+        (verifiedAnchor.uri != null || effectiveVirtualUri != null
+          ? verifiedAnchor.uri === effectiveVirtualUri
+          : verifiedAnchor.fileId === effectiveFileId);
       const declaredDowngrade =
         sameVerifiedSource && inventoryStatus != null && inventoryStatus !== "verified";
       if (declaredDowngrade) return;
@@ -3327,11 +3438,18 @@ export function usePlaybackSession(
       };
       const current = stateRef.current;
       const liveIdentity = menuIdentityRef.current;
+      // A row-only move of the same concrete candidate is not a source move:
+      // the probe can commit its evidence to the release's owner row while the
+      // client still holds the row its plan named. Treating that as a rotation
+      // would discard the delivered revision and leave the open session
+      // discovering until it is reopened.
+      const sameCandidate = identityNamesSameCandidate(identity, liveIdentity);
       const movedSource =
-        (payload.effective_media_file_id != null &&
+        !sameCandidate &&
+        ((payload.effective_media_file_id != null &&
           payload.effective_media_file_id !== liveIdentity.fileId) ||
-        (payload.effective_virtual_uri != null &&
-          payload.effective_virtual_uri !== liveIdentity.uri);
+          (payload.effective_virtual_uri != null &&
+            payload.effective_virtual_uri !== liveIdentity.uri));
       // The same adoption barrier as applyCommittedSource: a switch, an
       // in-flight replan, or a replacement start owns the session, so hold the
       // push and replay it against the plan that wins. Both event kinds must
@@ -3345,15 +3463,21 @@ export function usePlaybackSession(
       // No adoption in flight: a push that names another source than the player
       // is on is a stale delivery and is dropped. The synchronous mirror, not
       // the rendered state, is the live identity a rotation already committed.
-      if (
-        (payload.effective_media_file_id != null &&
-          liveIdentity.fileId != null &&
-          payload.effective_media_file_id !== liveIdentity.fileId) ||
-        (payload.effective_virtual_uri != null &&
-          liveIdentity.uri != null &&
-          payload.effective_virtual_uri !== liveIdentity.uri)
-      ) {
-        return false;
+      // The exception is a row-only move of the same concrete candidate: the
+      // candidate URI is the release identity, so the revision still describes
+      // the source on screen and is adopted (and its row becomes the live one)
+      // rather than discarded.
+      if (!sameCandidate) {
+        if (
+          (payload.effective_media_file_id != null &&
+            liveIdentity.fileId != null &&
+            payload.effective_media_file_id !== liveIdentity.fileId) ||
+          (payload.effective_virtual_uri != null &&
+            liveIdentity.uri != null &&
+            payload.effective_virtual_uri !== liveIdentity.uri)
+        ) {
+          return false;
+        }
       }
       // A file-only push cannot be tied to a candidate. When the live source
       // already names a concrete candidate on that same file, the file alone is
@@ -3750,23 +3874,51 @@ export function usePlaybackSession(
     );
   }, [applyInventoryUpdate, config]);
 
-  const markInventoryExhausted = useCallback(() => {
-    inventoryPendingRef.current = false;
-    setState((current) => {
-      if (!current.inventoryPending) {
-        // Nothing was pending; a later call must not resurrect a failure over
-        // menus that already render confident probe evidence.
-        return current;
-      }
-      // The attempt budget is spent. That is only a *failure* while a menu is
-      // still showing declared/loading tracks; once positive probe evidence
-      // (a verified push, a refreshed plan, or a catalog list) has resolved the
-      // inventory, a timed-out poll is moot and must not re-arm the
-      // "discovery did not complete" notice above a correct list.
-      const discoveryStillMissing =
-        current.audioInventoryProvisional || current.subtitleInventoryProvisional;
-      return { ...current, inventoryPending: false, inventoryFailed: discoveryStillMissing };
-    });
+  const markInventoryExhausted = useCallback(
+    (expected?: { sessionId?: string | null; mediaFileId?: number | null }) => {
+      // The identity is checked against the state this updater transitions, not
+      // the refs: a replacement plan can already be queued when a stale timer
+      // fires, so the rendered refs would still name the replaced session and
+      // mark its replacement failed. This mirrors the deferred poll's identity
+      // guard, with the queued update as the authority.
+      setState((latest) => {
+        if (
+          expected &&
+          (expected.sessionId !== latest.sessionId || expected.mediaFileId !== latest.mediaFileId)
+        ) {
+          return latest;
+        }
+        inventoryPendingRef.current = false;
+        // The attempt budget is spent. That is only a *failure* while a menu is
+        // still showing declared/loading tracks; once positive probe evidence
+        // (a verified push, a refreshed plan, or a catalog list) has resolved
+        // the inventory, the spent budget is moot and must not re-arm the
+        // "discovery did not complete" notice above a correct list. Nothing is
+        // owed then — no round is scheduled after exhaustion — so the pending
+        // flag must not outlive it and read as discovery still in flight.
+        if (!latest.audioInventoryProvisional && !latest.subtitleInventoryProvisional) {
+          return latest.inventoryPending ? { ...latest, inventoryPending: false } : latest;
+        }
+        return { ...latest, inventoryPending: false, inventoryFailed: true };
+      });
+    },
+    [],
+  );
+
+  /**
+   * Hands the discovery badge back to a fresh poll round.
+   *
+   * A deferred round that exhausted can be followed by the catalog fallback
+   * (WatchPage's legacy poll) still looking for probe evidence. Clearing the
+   * terminal marker here keeps the menus on "Discovering…" while that retry is
+   * actually in flight; the retry's own exhausted budget re-marks the failure.
+   * Without this, the terminal "discovery did not complete" notice would sit
+   * beside an active retry.
+   */
+  const markInventoryRetrying = useCallback(() => {
+    setState((current) =>
+      current.inventoryFailed ? { ...current, inventoryFailed: false } : current,
+    );
   }, []);
 
   return {
@@ -3780,11 +3932,14 @@ export function usePlaybackSession(
     recoverFromFailure,
     recoverConnection,
     retryConnection,
+    expediteReconnect,
+    reportSessionLost,
     invalidatePlan,
     reanchorSeek,
     refreshSubtitles,
     pollInventory,
     markInventoryExhausted,
+    markInventoryRetrying,
     applySubtitleTrack,
     applyAudioInventory,
     applyCommittedSource,
