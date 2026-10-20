@@ -94,6 +94,9 @@ func TestVirtualOriginalDelivery(t *testing.T) {
 			if response.Header().Get("Set-Cookie") != "" || strings.Contains(response.Header().Get("Content-Disposition"), "private-source") {
 				t.Fatal("provider metadata leaked into response")
 			}
+			if response.Header().Get("Content-Disposition") != attachmentDisposition("download-7.mp4") || response.Header().Get("Content-Type") != "video/mp4" {
+				t.Fatal("virtual download must carry a media filename and content type")
+			}
 			if testCase.wantStatus == http.StatusPartialContent && response.Header().Get("Content-Range") != "bytes 2-5/20" {
 				t.Fatalf("Content-Range = %q", response.Header().Get("Content-Range"))
 			}
@@ -111,6 +114,44 @@ func TestVirtualOriginalAccessDeniedBeforeResolve(t *testing.T) {
 	_, err := service.resolveDownloadBytesTarget(context.Background(), &Download{MediaFileID: file.ID, Format: FormatOriginal}, catalog.AccessFilter{AllowedLibraryIDs: []int{1}}, true, true)
 	if !errors.Is(err, catalog.ErrItemNotFound) || resolver.calls != 0 {
 		t.Fatalf("access denied = %v, resolver calls = %d", err, resolver.calls)
+	}
+}
+
+func TestVirtualOriginalSize(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		status    int
+		length    string
+		want      int64
+		wantError bool
+	}{
+		{name: "exact source length", status: http.StatusOK, length: "422458714", want: 422458714},
+		{name: "unknown length", status: http.StatusOK},
+		{name: "head unsupported", status: http.StatusMethodNotAllowed},
+		{name: "provider unavailable", status: http.StatusBadGateway, wantError: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodHead || request.Header.Get("Accept-Encoding") != "identity" {
+					t.Error("size lookup must request identity HEAD metadata")
+				}
+				if testCase.length != "" {
+					response.Header().Set("Content-Length", testCase.length)
+				}
+				response.WriteHeader(testCase.status)
+			}))
+			defer origin.Close()
+			cleanups := 0
+			service := &Service{virtualInput: &stubVirtualResolver{inputPath: origin.URL, cleanup: func() { cleanups++ }}}
+			file := &models.MediaFile{ID: 7, FileSize: 536870000, FilePath: "virtual://movie/tt1?result=a"}
+			size, err := service.virtualOriginalSize(context.Background(), file)
+			if (err != nil) != testCase.wantError || size != testCase.want || cleanups != 1 {
+				t.Fatalf("size = %d, error = %v, cleanups = %d", size, err, cleanups)
+			}
+			if file.FileSize != 536870000 {
+				t.Fatal("size lookup must not mutate catalog metadata")
+			}
+		})
 	}
 }
 

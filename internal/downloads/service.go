@@ -184,6 +184,7 @@ func (s *Service) SetOfflineDeps(detail ManifestSource, subs SubtitleSource, cli
 	})
 	s.manifest.MarkerPopulation = s.markerPopulation
 	s.manifest.externalTimings = s.externalTimings
+	s.manifest.originalSize = s.virtualOriginalSize
 	// A nil client leaves artwork fetches on artworkClient and its timeout.
 	s.httpClient = client
 }
@@ -1260,6 +1261,10 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 
 	if dl.Status == StatusPreparing {
 		return fmt.Errorf("download is preparing: %w", ErrDownloadNotActive)
+	}
+
+	if r.Method == http.MethodHead {
+		return s.serveDownloadBytes(ctx, w, r, dl, userID, filter)
 	}
 
 	// Atomically transition queued → downloading for original rows. Artifact

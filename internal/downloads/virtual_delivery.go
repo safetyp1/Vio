@@ -50,6 +50,50 @@ func (s *Service) SetVirtualInputResolver(resolver VirtualInputResolver) {
 	s.virtualInput = resolver
 }
 
+func (s *Service) virtualOriginalSize(ctx context.Context, file *models.MediaFile) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if s.virtualInput == nil {
+		return 0, ErrFormatUnavailable
+	}
+	input, cleanup, err := s.virtualInput.ResolveVirtualDownloadInput(ctx, file)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil || !isLoopbackPrepareInput(input) {
+		return 0, errors.New("virtual download source is unavailable")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, input, nil)
+	if err != nil {
+		return 0, errors.New("invalid virtual download relay request")
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	response, err := virtualDownloadClient.Do(request)
+	if err != nil {
+		return 0, errors.New("virtual download relay is unavailable")
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusMethodNotAllowed || response.StatusCode == http.StatusNotImplemented {
+		return 0, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("virtual download relay returned %d", response.StatusCode)
+	}
+	return max(0, response.ContentLength), nil
+}
+
+func virtualDownloadFilename(file *models.MediaFile) string {
+	extension := strings.ToLower(strings.TrimSpace(file.Container))
+	switch extension {
+	case "matroska":
+		extension = "mkv"
+	case "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mpeg", "mp3", "m4a", "flac", "ogg", "opus", "wav", "aac":
+	default:
+		extension = "bin"
+	}
+	return fmt.Sprintf("download-%d.%s", file.ID, extension)
+}
+
 func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWriter, r *http.Request, file *models.MediaFile, userID int) error {
 	if s.virtualInput == nil {
 		return ErrFormatUnavailable
@@ -86,8 +130,10 @@ func (s *Service) serveVirtualOriginal(ctx context.Context, w http.ResponseWrite
 	if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "dash+xml") {
 		return ErrFormatUnavailable
 	}
-	w.Header().Set("Content-Disposition", attachmentDisposition(fmt.Sprintf("download-%d", file.ID)))
 	downloadprepare.CopyResponseHeaders(w.Header(), response.Header)
+	filename := virtualDownloadFilename(file)
+	w.Header().Set("Content-Disposition", attachmentDisposition(filename))
+	w.Header().Set("Content-Type", playback.MimeFromExtension(filename))
 	if response.StatusCode == http.StatusPreconditionFailed || response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(response.StatusCode)

@@ -106,6 +106,15 @@ the server probes through playback's protected transport and commits the measure
 metadata before deciding compatibility. A failed probe or refused metadata write
 returns `quality_unavailable`; known incompatible sources retain the existing
 compatibility fallback.
+For virtual originals, manifest `file_size` and `integrity.expected_bytes` come
+from a bounded HEAD request through the protected relay, not the catalog's
+potentially rounded size hint. A missing length or unsupported HEAD reports zero
+(unknown); clients must not treat zero as an exact expected length. Source lookup
+failures fail the manifest request rather than asserting an estimated byte count.
+Download responses use a generated filename with the known media-container
+extension and media content type, falling back to `.bin` for unknown containers.
+The web save flow reads these headers before opening its file picker; HEAD does
+not mark an ephemeral download completed.
 The browser-only direct-file endpoint is unchanged and still rejects virtual files.
 
 `remux` is **not** a public quality preset. It is an internal delivery format used
