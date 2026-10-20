@@ -1337,7 +1337,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	if err != nil {
 		return errors.New("prepare remote stream request")
 	}
-	for _, header := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "Accept", "User-Agent"} {
+	for _, header := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "If-Match", "If-Unmodified-Since", "Accept", "User-Agent"} {
 		if value := request.Header.Get(header); value != "" {
 			upstream.Header.Set(header, value)
 		}
@@ -1368,6 +1368,8 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	if request.Method == http.MethodGet && relayToken != "" &&
 		upstream.Header.Get("If-Range") == "" &&
 		upstream.Header.Get("If-None-Match") == "" &&
+		upstream.Header.Get("If-Match") == "" &&
+		upstream.Header.Get("If-Unmodified-Since") == "" &&
 		upstream.Header.Get("If-Modified-Since") == "" {
 		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header), cacheScope)
 		if entry, ok := r.rangeCache.get(cacheKey); ok {
@@ -1442,7 +1444,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	}
 	responseReceivedAt := r.rangeCache.clock()
 	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode >= 400 && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+	if response.StatusCode >= 400 && response.StatusCode != http.StatusRequestedRangeNotSatisfiable && response.StatusCode != http.StatusPreconditionFailed {
 		drainCtx, drainCancel := context.WithTimeout(request.Context(), 1*time.Second)
 		defer drainCancel()
 		stopTimer := context.AfterFunc(drainCtx, func() {
@@ -1462,6 +1464,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		return errors.New("remote DASH manifests are not supported")
 	}
 	if request.Method == http.MethodHead || response.StatusCode == http.StatusNotModified ||
+		response.StatusCode == http.StatusPreconditionFailed ||
 		response.StatusCode == http.StatusNoContent || response.StatusCode == http.StatusRequestedRangeNotSatisfiable ||
 		strings.TrimSpace(response.Header.Get(headerContentLength)) == "0" {
 		copyRemoteResponseHeaders(w.Header(), response.Header)
