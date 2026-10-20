@@ -96,6 +96,18 @@ it. The row keeps the requested `quality`; `effective_quality` is `original`.
 `quality_options` in the capability (§3) reports each preset's resolution for
 labels.
 
+For registered downloads, virtual sources follow the same compatibility decision
+as local files. A direct-compatible `original` streams the selected source bytes
+through the API's existing virtual relay without FFmpeg or a prepared artifact.
+The relay preserves Range, HEAD, and conditional requests; resume support still
+depends on the provider. Provider URLs and credentials are not returned to clients.
+When device capabilities are supplied and the source container is still unknown,
+the server probes through playback's protected transport and commits the measured
+metadata before deciding compatibility. A failed probe or refused metadata write
+returns `quality_unavailable`; known incompatible sources retain the existing
+compatibility fallback.
+The browser-only direct-file endpoint is unchanged and still rejects virtual files.
+
 `remux` is **not** a public quality preset. It is an internal delivery format used
 when `original` is requested but device caps show the source only needs container
 or audio compatibility work. Rows expose both:
