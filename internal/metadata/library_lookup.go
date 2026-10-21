@@ -48,6 +48,7 @@ func (s *MetadataService) FetchLibraryMetadata(ctx context.Context, folderID int
 		}
 		_, isIdentityHinter := provider.(IdentityHintProvider)
 		foldProviderResult(result, value, language, provider.Slug(), isIdentityHinter, nil)
+		result.HasMetadata = true
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
