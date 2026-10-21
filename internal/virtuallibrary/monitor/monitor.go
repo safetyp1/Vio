@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/database/pglock"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/altmount"
@@ -1135,7 +1136,11 @@ func mediaFromRequest(r *RequestDescriptor) (monitoredMedia, error) {
 	if streamID == "" {
 		return monitoredMedia{}, errors.New("IMDb, TVDB, or TMDB ID is required")
 	}
-	return monitoredMedia{Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(), StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID}, nil
+	return monitoredMedia{
+		Key: typ + ":" + streamID, MediaType: typ, Title: strings.TrimSpace(r.GetTitle()), Year: r.GetYear(),
+		StreamID: streamID, IMDbID: imdb, TMDBID: tmdb, TVDBID: tvdb, SourceKey: "request:" + typ + ":" + streamID,
+		Poster: strings.TrimSpace(r.PosterPath), Backdrop: strings.TrimSpace(r.BackdropPath),
+	}, nil
 }
 
 func virtualContentID(item monitoredMedia) string {
@@ -2105,7 +2110,23 @@ func parseRuntimeMinutes(value string) int {
 }
 
 func cleanTVMazeSummary(value string) string {
-	return strings.TrimSpace(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+	return CleanMetadataSummary(value)
+}
+
+func CleanMetadataSummary(value string) string {
+	return CleanMetadataText(html.UnescapeString(htmlTagPattern.ReplaceAllString(value, "")))
+}
+
+func CleanMetadataText(value string) string {
+	return strings.TrimSpace(strings.Map(func(character rune) rune {
+		if unicode.IsSpace(character) {
+			return ' '
+		}
+		if unicode.IsControl(character) {
+			return -1
+		}
+		return character
+	}, value))
 }
 
 func (m *mediaMonitor) fetchTVMaze(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {

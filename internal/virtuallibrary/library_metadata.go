@@ -38,17 +38,28 @@ func (s *Service) SetLibraryMetadataResolver(resolver LibraryMetadataResolver) {
 		if result == nil {
 			return item, metadata.ErrMetadataNotFound
 		}
-		if result.Title != "" {
-			item.Title = result.Title
+		if title := monitor.CleanMetadataText(result.Title); title != "" {
+			item.Title = title
 		}
-		if result.Overview != "" {
-			item.Overview = result.Overview
+		if overview := monitor.CleanMetadataSummary(result.Overview); overview != "" {
+			item.Overview = overview
+		}
+		if poster := strings.TrimSpace(result.PosterPath); poster != "" {
+			item.Poster = poster
+		}
+		if backdrop := strings.TrimSpace(result.BackdropPath); backdrop != "" {
+			item.Backdrop = backdrop
 		}
 		if result.Runtime > 0 {
 			item.Runtime = result.Runtime
 		}
 		if len(result.Genres) > 0 {
-			item.Genres = append([]string(nil), result.Genres...)
+			item.Genres = make([]string, 0, len(result.Genres))
+			for _, genre := range result.Genres {
+				if genre = monitor.CleanMetadataText(genre); genre != "" {
+					item.Genres = append(item.Genres, genre)
+				}
+			}
 		}
 		if item.TMDBID == "" {
 			item.TMDBID = result.ProviderIDs["tmdb"]
@@ -65,7 +76,8 @@ func (s *Service) SetLibraryMetadataResolver(resolver LibraryMetadataResolver) {
 				if episode.SeasonNumber <= 0 || episode.EpisodeNumber <= 0 {
 					continue
 				}
-				if strings.TrimSpace(episode.Title) == "" {
+				title := monitor.CleanMetadataText(episode.Title)
+				if title == "" {
 					return item, fmt.Errorf("episode metadata is missing a title")
 				}
 				released, err := time.Parse(time.DateOnly, episode.AirDate)
@@ -77,7 +89,7 @@ func (s *Service) SetLibraryMetadataResolver(resolver LibraryMetadataResolver) {
 				}
 				fresh = append(fresh, monitor.VirtualEpisode{
 					Season: episode.SeasonNumber, Episode: episode.EpisodeNumber,
-					Title: episode.Title, Overview: episode.Overview,
+					Title: title, Overview: monitor.CleanMetadataSummary(episode.Overview),
 					Runtime: episode.Runtime, Thumbnail: episode.StillPath, Released: released,
 				})
 			}
