@@ -2954,6 +2954,7 @@ func main() {
 			slog.Warn("virtual library: settings unavailable; core service dormant", "error", vlErr)
 		}
 		if vlActive && vlSvc != nil {
+			vlSvc.SetLibraryMetadataResolver(metadataService)
 			// Hard cutover: core Variants replaces the plugin closure.
 			// Plugin-owned catalog rows keep their owner IDs; new variants
 			// carry core provenance (OwnerInstallationID 0 + Provenance core)

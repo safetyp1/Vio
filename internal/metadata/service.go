@@ -4055,7 +4055,7 @@ func (s *MetadataService) resolveSeriesRefreshProviderIDs(ctx context.Context, s
 	}
 	suppressProviderIDValues(accumulatedIDs, recordedStaleIDs)
 
-	itemChain, err := s.resolveChainCached(ctx, folderID, "series")
+	itemChain, err := s.resolveChainCached(ctx, folderID, series.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve series provider chain: %w", err)
 	}
@@ -4141,7 +4141,7 @@ func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, provider
 			dropLocalSeasonArtwork(seasons)
 		}
 		for _, season := range seasons {
-			if season.SeasonNumber != seasonNumber {
+			if seasonNumber >= 0 && season.SeasonNumber != seasonNumber {
 				continue
 			}
 			accumulateSeasonResults(seasonResults, []SeasonResult{season})

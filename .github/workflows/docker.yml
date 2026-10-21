@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      publish_dev:
+        description: "Also tag and push as :dev (default false)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: docker-${{ github.event.workflow_run.head_branch || github.ref_name }}
@@ -295,7 +300,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
-            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
+            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && (github.ref_name == github.event.repository.default_branch || inputs.publish_dev == true))) }}
             type=raw,value=latest,enable=${{ needs.prepare.outputs.is_stable == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
             type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
@@ -316,6 +321,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          PUBLISH_DEV: ${{ inputs.publish_dev }}
           EVENT_NAME: ${{ github.event_name }}
           IS_STABLE: ${{ needs.prepare.outputs.is_stable }}
         run: |
@@ -323,7 +329,7 @@ jobs:
           if [[ -n "${BUILD_NUMBER}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
           fi
-          if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
+          if [[ "${EVENT_NAME}" != "release" && ( "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" || "${PUBLISH_DEV}" == "true" ) ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
           fi
           if [[ "${IS_STABLE}" == "true" || "${PUBLISH_LATEST}" == "true" ]]; then

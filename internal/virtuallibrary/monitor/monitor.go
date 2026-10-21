@@ -144,6 +144,12 @@ func (s *Monitor) SetResolver(resolver connectionValidator) { s.resolver = resol
 // SetRegistrar installs the catalog registrar used by Fulfill/CheckStatus/Run.
 func (s *Monitor) SetRegistrar(registrar MediaRegistrar) { s.monitor.setRegistrar(registrar) }
 
+func (s *Monitor) SetMetadataResolver(resolve func(context.Context, MonitoredMedia) (MonitoredMedia, error)) {
+	s.monitor.mu.Lock()
+	defer s.monitor.mu.Unlock()
+	s.monitor.metadataResolver = resolve
+}
+
 // ReleaseStore returns the in-memory release schedule cache the monitor
 // populates while evaluating items. A nil result means the monitor is
 // unconfigured. The store implements the resolver's ReleaseGate: it fails open
@@ -520,7 +526,8 @@ type mediaMonitor struct {
 	itemTimeout time.Duration
 	// evaluateFn is the per-item evaluation step; tests replace it to make
 	// pass budgeting deterministic without provider network calls.
-	evaluateFn func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	evaluateFn       func(context.Context, monitoredMedia) (monitoredMedia, string, error)
+	metadataResolver func(context.Context, MonitoredMedia) (MonitoredMedia, error)
 }
 
 type virtualMediaLister interface {
@@ -1159,7 +1166,16 @@ func appendUniqueString(values []string, value string) []string {
 func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monitoredMedia, string, error) {
 	now := time.Now()
 	var metadataErr error
-	if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
+	m.mu.Lock()
+	resolveMetadata := m.metadataResolver
+	m.mu.Unlock()
+	if resolveMetadata != nil {
+		enriched, err := resolveMetadata(ctx, item)
+		if err != nil {
+			return item, "Library metadata unavailable; monitoring will retry", err
+		}
+		item = enriched
+	} else if enriched, err := m.fetchCinemeta(ctx, item); err == nil && (item.MediaType != "series" || episodeMetadataComplete(enriched.Episodes)) {
 		item = enriched
 		if item.MediaType == "series" && episodeRuntimeMissing(item.Episodes) {
 			if supplemented, supplementErr := m.fetchTVMaze(ctx, item); supplementErr == nil {
@@ -1179,8 +1195,10 @@ func (m *mediaMonitor) evaluate(ctx context.Context, item monitoredMedia) (monit
 		}
 	}
 	if item.MediaType == "movie" {
-		if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
-			item.Runtime = runtime
+		if resolveMetadata == nil {
+			if runtime, err := m.fetchTMDBMovieRuntime(ctx, item); err == nil && runtime > 0 {
+				item.Runtime = runtime
+			}
 		}
 		release, err := m.movieRelease(ctx, item)
 		if err != nil {
