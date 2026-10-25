@@ -123,8 +123,9 @@ type observation struct {
 	operationError error
 	// clientName and clientVersion are the clamped X-Silo-Client identity,
 	// read once when the request arrives.
-	clientName    string
-	clientVersion string
+	clientName     string
+	devicePlatform string
+	clientVersion  string
 }
 
 type observationKey struct{}
@@ -171,6 +172,7 @@ func observe(next http.Handler) http.Handler {
 		r = r.WithContext(ctx)
 		o := &observation{db: db, operationID: labelNone, errorCode: labelNone, authClass: authClassAnonymous}
 		o.clientName, o.clientVersion = clientIdentity(r)
+		o.devicePlatform = httpheader.Get(r.Header, "X-Vio-Device-Platform", "X-Silo-Device-Platform")
 		r = r.WithContext(context.WithValue(r.Context(), observationKey{}, o))
 		sw := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(sw, r)

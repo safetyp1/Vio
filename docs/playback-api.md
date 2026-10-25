@@ -279,7 +279,7 @@ the ordinary background evidence path (queued, coalescing write). A neutral
 group row is never probed speculatively — it may resolve to a sibling
 candidate, so the play path's own probe handles it. Chains are bounded (two
 concurrent, one per item, a whole-chain deadline, and the shared probe
-gate), never block any API response, and never wait for playback: a chain may
+gate), do not block web API responses, and never wait for playback: a chain may
 record evidence before a play attempt resolves the same row, in which case that
 attempt reuses it, and a play attempt that resolves first probes on its own as
 usual. Foreground probing may still be required when the chain has not
@@ -290,6 +290,19 @@ persistence rules, including their stale-write protections; probing
 failures arm the same failure damper the playback path uses, an
 already-stamped row is skipped, and every unexpected chain failure —
 including a panic — is contained to the chain.
+
+For native iOS, Android, and Android TV requests, the two leaf-detail endpoints
+wait for discovery and preparation of the default version (or the explicit
+`file_id`) before re-reading detail and returning its stored tracks. The client
+is identified by `X-Vio-Device-Platform` or the legacy
+`X-Silo-Device-Platform`; browser user agents do not enable this behavior.
+Discovery and preparation share a 90-second request-bound budget. Preparation
+joins an existing chain or waits for a slot within the same two-chain limit,
+and already-probed versions do not run ffprobe again. Native reads within the
+30-second discovery memo window still prepare and reload detail. A timeout,
+provider failure, or unsafe target remains best-effort: the endpoint returns
+available detail rather than failing the page. Web clients retain the short
+discovery budgets, detached probing, and catalog-event refresh behavior.
 
 A successful detail discovery is memoized for 30 seconds per viewer, item,
 selected file, and library. The player's inventory poll re-reads watch detail

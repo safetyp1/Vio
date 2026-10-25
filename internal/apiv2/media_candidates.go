@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
@@ -62,7 +63,33 @@ const (
 	// limit. Expired entries are swept first; if the map is still full, it is
 	// cleared, which only costs one extra discovery per item.
 	preplayDiscoveryDetailMemoMaxEntries = 512
+	preplayNativePreparationBudget       = 90 * time.Second
 )
+
+func nativePreplayPreparation(ctx context.Context) bool {
+	observation := observationFrom(ctx)
+	if observation == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(observation.devicePlatform)) {
+	case "ios", "android", "android-tv", "android tv", "androidtv", "android_tv":
+		return true
+	default:
+		return false
+	}
+}
+
+func (reg *Registry) prepareNativeDetailVersion(ctx context.Context, contentID string, filter catalogpkg.AccessFilter) {
+	preparer, ok := reg.deps.VirtualCandidatesDiscovery.(interface {
+		PrepareDefaultFileProbe(context.Context, int, string, string, catalogpkg.AccessFilter) error
+	})
+	if !ok {
+		return
+	}
+	if err := preparer.PrepareDefaultFileProbe(ctx, claimsFrom(ctx).UserID, profileFrom(ctx), contentID, filter); err != nil {
+		slog.WarnContext(ctx, "native pre-play preparation unavailable", "component", "apiv2", "item_id", contentID)
+	}
+}
 
 // preplayDiscoveryMemoKey identifies one viewer's detail read for one item and
 // selected version. The selected file is part of the key: switching versions
@@ -154,6 +181,13 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
 		return false, hasVirtualSource
 	}
+	native := nativePreplayPreparation(ctx)
+	if native {
+		preparationCtx, cancel := context.WithTimeout(ctx, preplayNativePreparationBudget)
+		defer cancel()
+		ctx = preparationCtx
+		budget = preplayNativePreparationBudget
+	}
 	memoKey := preplayDiscoveryMemoKey(ctx, contentID, filter)
 	if reg.preplayDiscoveryRecentlyRan(memoKey) {
 		// The player polls watch detail for inventory while the pre-play probe
@@ -162,6 +196,10 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 		// window already did the work.
 		slog.DebugContext(ctx, "pre-play version discovery coalesced", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "selected_file_id", filter.SelectedFileID)
+		if native {
+			reg.prepareNativeDetailVersion(ctx, contentID, filter)
+			return true, true
+		}
 		return false, true
 	}
 	started := time.Now()
@@ -180,6 +218,9 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
 		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
 	reg.rememberPreplayDiscovery(memoKey)
+	if native {
+		reg.prepareNativeDetailVersion(ctx, contentID, filter)
+	}
 	return true, true
 }
 

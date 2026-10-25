@@ -194,6 +194,8 @@ type defaultProbeChainAdmission struct {
 	mu       sync.Mutex
 	active   map[string]struct{}
 	cancel   map[string]context.CancelFunc
+	done     map[string]chan struct{}
+	changed  chan struct{}
 	admitted int
 }
 
@@ -234,6 +236,10 @@ func (a *defaultProbeChainAdmission) acquireWithCancel(contentID string, cancel 
 		return nil, defaultProbeChainRefusalCapacity
 	}
 	a.active[contentID] = struct{}{}
+	if a.done == nil {
+		a.done = make(map[string]chan struct{})
+	}
+	a.done[contentID] = make(chan struct{})
 	if cancel != nil {
 		if a.cancel == nil {
 			a.cancel = make(map[string]context.CancelFunc)
@@ -267,7 +273,75 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 	}
 	delete(a.active, contentID)
 	delete(a.cancel, contentID)
+	if done := a.done[contentID]; done != nil {
+		close(done)
+		delete(a.done, contentID)
+	}
 	a.admitted--
+	if a.changed != nil {
+		close(a.changed)
+		a.changed = nil
+	}
+}
+
+func (h *PlaybackHandler) PrepareDefaultFileProbe(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) error {
+	if h == nil || h.DefaultProbeTarget == nil || source == nil || len(streams) == 0 {
+		return nil
+	}
+	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	key := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		release, refusal := h.defaultProbeChains.acquireWithCancel(key, cancel)
+		switch refusal {
+		case defaultProbeChainRefusalNone:
+			defer release()
+			h.runDefaultFileProbeChain(ctx, contentID, source, streams, filter)
+			return ctx.Err()
+		case defaultProbeChainRefusalLive:
+			if err := h.WaitDefaultFileProbe(ctx, contentID, filter); err != nil {
+				return err
+			}
+		case defaultProbeChainRefusalCapacity:
+			h.defaultProbeChains.mu.Lock()
+			if h.defaultProbeChains.admitted < virtualDefaultProbeChainConcurrency {
+				h.defaultProbeChains.mu.Unlock()
+				continue
+			}
+			if h.defaultProbeChains.changed == nil {
+				h.defaultProbeChains.changed = make(chan struct{})
+			}
+			changed := h.defaultProbeChains.changed
+			h.defaultProbeChains.mu.Unlock()
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+func (h *PlaybackHandler) WaitDefaultFileProbe(ctx context.Context, contentID string, filter catalog.AccessFilter) error {
+	key := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
+	h.defaultProbeChains.mu.Lock()
+	done := h.defaultProbeChains.done[key]
+	h.defaultProbeChains.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // cancelDefaultFileProbe drops a detached pre-play probe for the content/file
