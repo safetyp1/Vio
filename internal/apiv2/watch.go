@@ -380,7 +380,10 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 	// virtual candidates even when nothing new is discovered this read.
 	var virtualSource *bool
 	if detail != nil {
-		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget)
+		discovered, hasVirtualSource, preparedFileID := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, filter, "watch_detail", preplayDiscoveryWatchBudget)
+		if preparedFileID > 0 {
+			filter.SelectedFileID = preparedFileID
+		}
 		if hasVirtualSource {
 			source := hasVirtualSource
 			virtualSource = &source
@@ -389,6 +392,7 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 			refreshed, refreshErr := reg.deps.Watch.WatchDetail(ctx, claims.UserID, profileFrom(ctx), string(in.ID), filter)
 			if refreshErr == nil && refreshed != nil {
 				detail = refreshed
+				preferPreparedVersion(detail.Versions, preparedFileID)
 			} else {
 				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", in.ID, "trigger", "watch_detail")
 			}

@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -284,29 +286,28 @@ func (a *defaultProbeChainAdmission) release(contentID string) {
 	}
 }
 
-func (h *PlaybackHandler) PrepareDefaultFileProbe(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) error {
-	if h == nil || h.DefaultProbeTarget == nil || source == nil || len(streams) == 0 {
-		return nil
+func (h *PlaybackHandler) PrepareDefaultFileProbe(ctx context.Context, contentID string, filter catalog.AccessFilter, deviceID string) (int, error) {
+	if h == nil || h.DefaultProbeTarget == nil {
+		return 0, nil
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
-		return nil
+		return 0, nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	key := contentID + "\x00" + strconv.Itoa(filter.SelectedFileID)
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return 0, err
 		}
 		release, refusal := h.defaultProbeChains.acquireWithCancel(key, cancel)
 		switch refusal {
 		case defaultProbeChainRefusalNone:
 			defer release()
-			h.runDefaultFileProbeChain(ctx, contentID, source, streams, filter)
-			return ctx.Err()
+			return h.prepareNativeAutoVersion(ctx, contentID, filter, deviceID)
 		case defaultProbeChainRefusalLive:
 			if err := h.WaitDefaultFileProbe(ctx, contentID, filter); err != nil {
-				return err
+				return 0, err
 			}
 		case defaultProbeChainRefusalCapacity:
 			h.defaultProbeChains.mu.Lock()
@@ -322,10 +323,65 @@ func (h *PlaybackHandler) PrepareDefaultFileProbe(ctx context.Context, contentID
 			select {
 			case <-changed:
 			case <-ctx.Done():
-				return ctx.Err()
+				return 0, ctx.Err()
 			}
 		}
 	}
+}
+
+func (h *PlaybackHandler) prepareNativeAutoVersion(ctx context.Context, contentID string, filter catalog.AccessFilter, deviceID string) (int, error) {
+	row, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, filter)
+	if err != nil {
+		return 0, err
+	}
+	if row == nil || !isVirtualPlaybackFile(row) {
+		return 0, nil
+	}
+	if row.ProbeUpdatedAt != nil && completeVirtualVideoEvidenceV3(row) && completeVirtualAudioEvidenceV3(row) && completeVirtualContainerEvidenceV3(row) {
+		return row.ID, nil
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("X-Vio-Device-Id", deviceID)
+	request.Header.Set("X-Silo-Device-Id", deviceID)
+	resolved, err := h.resolveVirtualPlaybackSource(request, row, filter.ProfileID, false, nil, "", "auto", 0, false, virtualResolveOptionsV3{
+		explicitSelection:  filter.SelectedFileID != 0 && virtualResultCandidateID(row.FilePath) != "",
+		durablePreparation: true,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !resolved.ProbeSucceeded || resolved.Provenance != ProbeProvenanceVerified || resolved.File == nil || !completeVirtualVideoEvidenceV3(resolved.File) || !completeVirtualAudioEvidenceV3(resolved.File) || !completeVirtualContainerEvidenceV3(resolved.File) {
+		return 0, fmt.Errorf("default version probe did not produce verified inventory")
+	}
+	selectedFilter := filter
+	selectedFilter.SelectedFileID = resolved.File.ID
+	owner, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, selectedFilter)
+	if err != nil {
+		return 0, err
+	}
+	if owner == nil || owner.ID != resolved.File.ID || owner.VirtualOwnerInstallationID != resolved.OwnerID || owner.ContentID != row.ContentID || owner.EpisodeID != row.EpisodeID || owner.MediaFolderID != row.MediaFolderID {
+		return 0, fmt.Errorf("resolved default version has no authorized candidate row")
+	}
+	if owner.FilePath != resolved.URI && (virtualResultCandidateID(owner.FilePath) != "" || owner.FilePath != virtualPlaybackNeutralKey(resolved.URI)) {
+		return 0, fmt.Errorf("resolved default version does not own the selected release")
+	}
+	inventory, committed := h.persistVirtualProbeEvidenceDurable(ctx, owner, resolved.URI, resolved.File, resolvedSourceIdentity(&resolved).tiers(), true)
+	if !committed {
+		return 0, fmt.Errorf("native pre-play probe evidence did not commit")
+	}
+	selectedFilter.SelectedFileID = inventory.fileID
+	prepared, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, selectedFilter)
+	if err != nil || prepared == nil || prepared.ID != inventory.fileID || prepared.FilePath != resolved.URI || prepared.MediaFolderID != owner.MediaFolderID || prepared.VirtualOwnerInstallationID != resolved.OwnerID {
+		return 0, fmt.Errorf("committed default version is no longer available")
+	}
+	slog.InfoContext(ctx, "native pre-play preparation completed", "component", "api", "content_id", contentID, "file_id", prepared.ID)
+	if h.EventsHub != nil {
+		publishVirtualVersionsUpdatedEvent(ctx, nil, h.EventsHub, contentID)
+	}
+	return prepared.ID, nil
 }
 
 func (h *PlaybackHandler) WaitDefaultFileProbe(ctx context.Context, contentID string, filter catalog.AccessFilter) error {

@@ -125,6 +125,7 @@ type observation struct {
 	// read once when the request arrives.
 	clientName     string
 	devicePlatform string
+	deviceID       string
 	clientVersion  string
 }
 
@@ -173,6 +174,7 @@ func observe(next http.Handler) http.Handler {
 		o := &observation{db: db, operationID: labelNone, errorCode: labelNone, authClass: authClassAnonymous}
 		o.clientName, o.clientVersion = clientIdentity(r)
 		o.devicePlatform = httpheader.Get(r.Header, "X-Vio-Device-Platform", "X-Silo-Device-Platform")
+		o.deviceID = httpheader.Get(r.Header, "X-Vio-Device-Id", "X-Silo-Device-Id")
 		r = r.WithContext(context.WithValue(r.Context(), observationKey{}, o))
 		sw := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(sw, r)

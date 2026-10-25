@@ -79,15 +79,31 @@ func nativePreplayPreparation(ctx context.Context) bool {
 	}
 }
 
-func (reg *Registry) prepareNativeDetailVersion(ctx context.Context, contentID string, filter catalogpkg.AccessFilter) {
+func (reg *Registry) prepareNativeDetailVersion(ctx context.Context, contentID string, filter catalogpkg.AccessFilter) int {
 	preparer, ok := reg.deps.VirtualCandidatesDiscovery.(interface {
-		PrepareDefaultFileProbe(context.Context, int, string, string, catalogpkg.AccessFilter) error
+		PrepareDefaultFileProbe(context.Context, int, string, string, catalogpkg.AccessFilter, string) (int, error)
 	})
 	if !ok {
+		return 0
+	}
+	fileID, err := preparer.PrepareDefaultFileProbe(ctx, claimsFrom(ctx).UserID, profileFrom(ctx), contentID, filter, observationFrom(ctx).deviceID)
+	if err != nil {
+		slog.WarnContext(ctx, "native pre-play preparation unavailable", "component", "apiv2", "item_id", contentID, "canceled", ctx.Err() != nil)
+		return 0
+	}
+	return fileID
+}
+
+func preferPreparedVersion(versions []catalogpkg.FileVersion, fileID int) {
+	if fileID <= 0 {
 		return
 	}
-	if err := preparer.PrepareDefaultFileProbe(ctx, claimsFrom(ctx).UserID, profileFrom(ctx), contentID, filter); err != nil {
-		slog.WarnContext(ctx, "native pre-play preparation unavailable", "component", "apiv2", "item_id", contentID)
+	for index, version := range versions {
+		if version.FileID == fileID {
+			copy(versions[1:index+1], versions[:index])
+			versions[0] = version
+			return
+		}
 	}
 }
 
@@ -157,11 +173,11 @@ func (reg *Registry) preplayDiscoveryCatalogBudgetFor(ctx context.Context) time.
 // discoverDetailVersions runs the candidate discovery a detail-page read needs
 // and reports whether it found any. A detail-page read may start the pre-play
 // preparation; a bare listing request may not.
-func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool) {
+func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, mediaType string, filter catalogpkg.AccessFilter, trigger string, budget time.Duration) (discovered, hasVirtualSource bool, preparedFileID int) {
 	claims := claimsFrom(ctx)
 	if claims == nil || (mediaType != themeOwnerMovie && mediaType != themeOwnerEpisode) ||
 		reg.deps.VirtualCandidatesDiscovery == nil {
-		return false, false
+		return false, false, 0
 	}
 	// Eligibility reads the stored rows server-side instead of the caller's
 	// (possibly path-redacted) version list, so ordinary viewers reach the
@@ -172,14 +188,14 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	if err != nil {
 		slog.WarnContext(ctx, "pre-play version discovery skipped", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "reason", "eligibility_lookup_failed", "error", err)
-		return false, false
+		return false, false, 0
 	}
 	hasVirtualSource = virtual
 	if !virtual {
-		return false, false
+		return false, false, 0
 	}
 	if reg.deps.PreplayDiscoveryEnabled == nil || !reg.deps.PreplayDiscoveryEnabled(ctx) {
-		return false, hasVirtualSource
+		return false, hasVirtualSource, 0
 	}
 	native := nativePreplayPreparation(ctx)
 	if native {
@@ -197,10 +213,9 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 		slog.DebugContext(ctx, "pre-play version discovery coalesced", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "selected_file_id", filter.SelectedFileID)
 		if native {
-			reg.prepareNativeDetailVersion(ctx, contentID, filter)
-			return true, true
+			return true, true, reg.prepareNativeDetailVersion(ctx, contentID, filter)
 		}
-		return false, true
+		return false, true, 0
 	}
 	started := time.Now()
 	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
@@ -213,15 +228,15 @@ func (reg *Registry) discoverDetailVersions(ctx context.Context, contentID, medi
 	if listErr != nil {
 		slog.WarnContext(ctx, "pre-play version discovery unavailable", "component", "apiv2", "item_id", contentID,
 			"trigger", trigger, "duration_ms", time.Since(started).Milliseconds())
-		return false, true
+		return false, true, 0
 	}
 	slog.InfoContext(ctx, "pre-play version discovery completed", "component", "apiv2", "item_id", contentID,
 		"trigger", trigger, "count", len(listed), "duration_ms", time.Since(started).Milliseconds())
 	reg.rememberPreplayDiscovery(memoKey)
 	if native {
-		reg.prepareNativeDetailVersion(ctx, contentID, filter)
+		preparedFileID = reg.prepareNativeDetailVersion(ctx, contentID, filter)
 	}
-	return true, true
+	return true, true, preparedFileID
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the

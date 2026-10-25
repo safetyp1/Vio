@@ -1846,6 +1846,7 @@ type virtualResolveOptionsV3 struct {
 	// A synchronous replan/rehydration leaves it false so the probed inventory
 	// is available on its response.
 	deferProbePastCommit bool
+	durablePreparation   bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -3218,6 +3219,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
+		if options.durablePreparation && dbFound && (dbFile == nil || dbFile.ContentID != file.ContentID || dbFile.EpisodeID != file.EpisodeID || dbFile.MediaFolderID != file.MediaFolderID || dbFile.VirtualOwnerInstallationID != oid) {
+			return nil, fmt.Errorf("native preparation candidate is outside the authorized source scope")
+		}
 		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed
 			// (a transport produced no bytes, or the decoder rejected the
@@ -3517,7 +3521,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
 			return mergeDeclaredFallback(ProbeProvenanceFailed)
 		}
-		if skipProbe && !substituted {
+		if skipProbe && !substituted && !options.durablePreparation {
 			if transient.Resolution == "" {
 				transient.Resolution = cand.Resolution
 			}
@@ -3739,7 +3743,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Persist probed audio/subtitle tracks back to the DB so
 			// the watch detail and player UI show track options on
 			// subsequent views without re-probing.
-			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), result.Provenance == ProbeProvenanceVerified, true)
+			if !options.durablePreparation {
+				h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, resolvedSourceIdentity(result).tiers(), result.Provenance == ProbeProvenanceVerified, true)
+			}
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -3767,7 +3773,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				break
 			}
 		}
-		if firstResolved.Provenance == ProbeProvenanceVerified {
+		if firstResolved.Provenance == ProbeProvenanceVerified && !options.durablePreparation {
 			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, resolvedSourceIdentity(firstResolved).tiers(), true, true)
 		}
 		// The rank/count were set where this result was produced; a

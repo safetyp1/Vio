@@ -1253,7 +1253,10 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 	// discovery is enabled.
 	var virtualSource *bool
 	if detail != nil {
-		discovered, hasVirtualSource := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx))
+		discovered, hasVirtualSource, preparedFileID := reg.discoverDetailVersions(ctx, detail.ContentID, detail.Type, viewer.Access, "catalog_detail", reg.preplayDiscoveryCatalogBudgetFor(ctx))
+		if preparedFileID > 0 {
+			viewer.Access.SelectedFileID = preparedFileID
+		}
 		if hasVirtualSource {
 			source := hasVirtualSource
 			virtualSource = &source
@@ -1262,6 +1265,7 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 			refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
 			if refreshErr == nil && refreshed != nil {
 				detail = refreshed
+				preferPreparedVersion(detail.Versions, preparedFileID)
 			} else {
 				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
 			}

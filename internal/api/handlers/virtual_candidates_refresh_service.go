@@ -163,8 +163,7 @@ type VirtualCandidatesRefreshService struct {
 	// same visible default the discovery response offered.
 	// PlaybackHandler.ScheduleDefaultFileProbe implements this.
 	ScheduleDefaultFileProbe func(contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter)
-	PrepareDefaultProbe      func(ctx context.Context, contentID string, source *models.MediaFile, streams []VirtualPlaybackStream, filter catalog.AccessFilter) error
-	DefaultProbeTarget       VirtualDefaultProbeTarget
+	PrepareDefaultProbe      func(ctx context.Context, contentID string, filter catalog.AccessFilter, deviceID string) (int, error)
 
 	flight      singleflight.Group
 	sourceLocks [64]sync.Mutex
@@ -195,40 +194,14 @@ func (s *VirtualCandidatesRefreshService) DiscoverVirtualCandidates(ctx context.
 	return s.listVirtualCandidates(ctx, userID, profileID, contentID, filter, s.ListCached, "discover:", mode)
 }
 
-func (s *VirtualCandidatesRefreshService) PrepareDefaultFileProbe(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) error {
-	if s == nil || s.PrepareDefaultProbe == nil || s.DefaultProbeTarget == nil || s.ListCached == nil || s.Detail == nil {
-		return nil
+func (s *VirtualCandidatesRefreshService) PrepareDefaultFileProbe(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter, deviceID string) (int, error) {
+	if s == nil || s.PrepareDefaultProbe == nil || s.Detail == nil {
+		return 0, nil
 	}
 	if _, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter); err != nil {
-		return err
+		return 0, err
 	}
-	target, err := s.DefaultProbeTarget.DefaultVirtualProbeTarget(ctx, contentID, filter)
-	if err != nil {
-		return err
-	}
-	if target == nil || !isVirtualPlaybackFile(target) || target.ProbeUpdatedAt != nil {
-		return nil
-	}
-	sources, err := s.virtualSources(ctx, contentID)
-	if err != nil {
-		return err
-	}
-	var listErr error
-	for _, source := range sources {
-		if source.VirtualOwnerInstallationID != target.VirtualOwnerInstallationID {
-			continue
-		}
-		streams, err := s.ListCached.ListVirtualPlaybackStreams(ctx, source.FilePath, userID, profileID, source.VirtualOwnerInstallationID)
-		if err != nil {
-			listErr = err
-			continue
-		}
-		if virtualDefaultProbeCandidate(target, source, streams, filter.SelectedFileID != 0) == nil {
-			continue
-		}
-		return s.PrepareDefaultProbe(ctx, contentID, source, streams, filter)
-	}
-	return listErr
+	return s.PrepareDefaultProbe(ctx, contentID, filter, deviceID)
 }
 
 // HasVirtualSource reports whether the item holds at least one persisted

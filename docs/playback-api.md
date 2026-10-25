@@ -293,7 +293,13 @@ including a panic — is contained to the chain.
 
 For native iOS, Android, and Android TV requests, the two leaf-detail endpoints
 wait for discovery and preparation of the default version (or the explicit
-`file_id`) before re-reading detail and returning its stored tracks. The client
+`file_id`) before re-reading detail and returning its stored tracks. A neutral
+source row is resolved using playback's Auto candidate selection, including the
+profile's streaming preferences and the persisted capabilities associated with
+the device ID. Preparation requires verified audio and video evidence to commit
+on the authorized concrete release row. The refreshed response selects that
+release and puts it first in the version list; a neutral row does not inherit
+another release's tracks. The client
 is identified by `X-Vio-Device-Platform` or the legacy
 `X-Silo-Device-Platform`; browser user agents do not enable this behavior.
 Discovery and preparation share a 90-second request-bound budget. Preparation
