@@ -20,6 +20,7 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	langpkg "github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -1847,6 +1848,7 @@ type virtualResolveOptionsV3 struct {
 	// is available on its response.
 	deferProbePastCommit bool
 	durablePreparation   bool
+	preparationFilter    *catalog.AccessFilter
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -3219,8 +3221,26 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
-		if options.durablePreparation && dbFound && (dbFile == nil || dbFile.ContentID != file.ContentID || dbFile.EpisodeID != file.EpisodeID || dbFile.MediaFolderID != file.MediaFolderID || dbFile.VirtualOwnerInstallationID != oid) {
-			return nil, fmt.Errorf("native preparation candidate is outside the authorized source scope")
+		if options.durablePreparation && dbFound {
+			if dbFile == nil || dbFile.ContentID != file.ContentID || dbFile.EpisodeID != file.EpisodeID || dbFile.MediaFolderID != file.MediaFolderID || (oid != 0 && dbFile.VirtualOwnerInstallationID != oid) || (file.VirtualOwnerInstallationID != 0 && dbFile.VirtualOwnerInstallationID != file.VirtualOwnerInstallationID) {
+				return nil, fmt.Errorf("native preparation candidate is outside the authorized source scope")
+			}
+			if oid == 0 {
+				if h.DefaultProbeTarget == nil || options.preparationFilter == nil {
+					return nil, fmt.Errorf("native preparation candidate authorization is unavailable")
+				}
+				selected := *options.preparationFilter
+				selected.SelectedFileID = dbFile.ID
+				itemID := file.EpisodeID
+				if itemID == "" {
+					itemID = file.ContentID
+				}
+				authorized, err := h.DefaultProbeTarget.DefaultVirtualProbeTarget(attemptCtx, itemID, selected)
+				if err != nil || authorized == nil || authorized.ID != dbFile.ID || authorized.FilePath != dbFile.FilePath || authorized.VirtualOwnerInstallationID != dbFile.VirtualOwnerInstallationID {
+					return nil, fmt.Errorf("native preparation candidate owner is not authorized")
+				}
+				oid = authorized.VirtualOwnerInstallationID
+			}
 		}
 		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed

@@ -349,6 +349,7 @@ func (h *PlaybackHandler) prepareNativeAutoVersion(ctx context.Context, contentI
 	resolved, err := h.resolveVirtualPlaybackSource(request, row, filter.ProfileID, false, nil, "", "auto", 0, false, virtualResolveOptionsV3{
 		explicitSelection:  filter.SelectedFileID != 0 && virtualResultCandidateID(row.FilePath) != "",
 		durablePreparation: true,
+		preparationFilter:  &filter,
 	})
 	if err != nil {
 		return 0, err
