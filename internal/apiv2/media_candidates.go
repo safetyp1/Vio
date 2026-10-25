@@ -94,7 +94,7 @@ func (reg *Registry) prepareNativeDetailVersion(ctx context.Context, contentID s
 	return fileID
 }
 
-func preferPreparedVersion(versions []catalogpkg.FileVersion, fileID int) {
+func preferPreparedVersion(versions []catalogpkg.FileVersion, variants []catalogpkg.PlaybackVariant, fileID int) {
 	if fileID <= 0 {
 		return
 	}
@@ -102,7 +102,25 @@ func preferPreparedVersion(versions []catalogpkg.FileVersion, fileID int) {
 		if version.FileID == fileID {
 			copy(versions[1:index+1], versions[:index])
 			versions[0] = version
-			return
+			break
+		}
+	}
+	for index, variant := range variants {
+		for partIndex := range variant.Parts {
+			part := &variant.Parts[partIndex]
+			for _, version := range part.Versions {
+				if version.FileID != fileID {
+					continue
+				}
+				part.DefaultFileID = fileID
+				preferPreparedVersion(part.Versions, nil, fileID)
+				if partIndex == 0 {
+					variant.DefaultFileID = fileID
+				}
+				copy(variants[1:index+1], variants[:index])
+				variants[0] = variant
+				return
+			}
 		}
 	}
 }

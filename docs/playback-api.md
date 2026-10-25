@@ -296,10 +296,16 @@ wait for discovery and preparation of the default version (or the explicit
 `file_id`) before re-reading detail and returning its stored tracks. A neutral
 source row is resolved using playback's Auto candidate selection, including the
 profile's streaming preferences and the persisted capabilities associated with
-the device ID. Preparation requires verified audio and video evidence to commit
+the device ID. Only the initially selected candidate is attempted: preparation
+does not prefer an already-probed sibling, walk backup releases, or run the
+stale-source fallback. A provider-reported replacement release ends preparation;
+a durable-identity rematch of the same release remains eligible. Preparation
+requires verified audio and video evidence to commit
 on the authorized concrete release row. The refreshed response selects that
-release and puts it first in the version list; a neutral row does not inherit
-another release's tracks. The client
+release and puts it first in both the version and playback-variant lists, with
+the matching part default selected; a neutral row does not inherit another
+release's tracks. Playback startup keeps its existing probing and fallback
+behavior and does not wait for additional replacement verification. The client
 is identified by `X-Vio-Device-Platform` or the legacy
 `X-Silo-Device-Platform`; browser user agents do not enable this behavior.
 Discovery and preparation share a 90-second request-bound budget. Preparation

@@ -1265,7 +1265,7 @@ func (reg *Registry) getCatalogItem(ctx context.Context, in *CatalogItemDeviceIn
 			refreshed, refreshErr := svc.ItemDetail(ctx, viewer, in.ID)
 			if refreshErr == nil && refreshed != nil {
 				detail = refreshed
-				preferPreparedVersion(detail.Versions, preparedFileID)
+				preferPreparedVersion(detail.Versions, detail.PlaybackVariants, preparedFileID)
 			} else {
 				slog.WarnContext(ctx, "pre-play version discovery detail reload failed", "component", "apiv2", "item_id", detail.ContentID, "trigger", "catalog_detail")
 			}

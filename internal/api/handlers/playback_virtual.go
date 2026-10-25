@@ -2791,8 +2791,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// has to rotate — the very cascade this preference exists to avoid. A row
 	// the planner can route (complete evidence) keeps the existing noResult-
 	// only behavior, so this only ever promotes a probed sibling over a stub.
-	if (noResult || needsProbeVerification) && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+	if (noResult || needsProbeVerification) && !options.sessionBound && !options.explicitSelection && !options.durablePreparation && len(candidates) > 1 {
 		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
+	}
+	if options.durablePreparation {
+		maxAttempts = 1
 	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
@@ -2827,7 +2830,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// non-explicit selection qualifies: a session binding must not swap the
 	// release it is serving, and an explicit version pick keeps the refusal so
 	// the client can offer the version list.
-	attemptCtx = virtuallibrary.WithAutoProfileFallback(attemptCtx, !options.sessionBound && !options.explicitSelection)
+	attemptCtx = virtuallibrary.WithAutoProfileFallback(attemptCtx, !options.sessionBound && !options.explicitSelection && !options.durablePreparation)
 
 	// fastPathHit records that resolveAndProbe returned the repeat-play fast
 	// path so the candidate loop can return it immediately instead of treating
@@ -2835,6 +2838,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	fastPathHit := false
 
 	resolveAndProbe := func(i int, cand VirtualPlaybackStream) (*resolvedVirtualPlaybackSource, error) {
+		if options.durablePreparation && virtualResultCandidateID(cand.URI) == "" {
+			return nil, errors.New("initial pre-play candidate has no concrete release")
+		}
 		// requestedURI is the candidate this iteration asked the resolver for.
 		// The detailed resolver may rewrite cand.URI to a substituted sibling
 		// (a fresh-selection fall-through or a dedup keeper); keeping the
@@ -3080,8 +3086,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// binding or an explicit pick): an auto selection must not inherit
 			// a trust that would suppress its fallback.
 			candidateCtx := attemptCtx
+			if options.durablePreparation {
+				candidateCtx = withVirtualSessionBindingV3(candidateCtx, true)
+			}
 			if sameVirtualReleaseIdentity(file.FilePath, cand.URI) && (options.sessionBound || explicitSelection) {
-				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(file, oid))
+				candidateCtx = virtualResolveContextWithPersistedTrust(candidateCtx, file, time.Now(), h.virtualCandidateTrustWindow(), h.storedVirtualURLAllowInsecure(file, oid))
 			}
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				candidateCtx, cand.URI, oid, userID, profileID, providerRelist, excludedCandidateIDs, preferredCandidateID,
@@ -3101,6 +3110,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					resolvedID = virtualResultCandidateID(res.URI)
 				}
 				substituted = resolvedID != "" && probedCandidateID != "" && resolvedID != probedCandidateID
+				if options.durablePreparation && substituted && !resolvedRematched {
+					return nil, errors.New("initial pre-play candidate was replaced by the provider")
+				}
 				if res.URI != "" {
 					cand.URI = res.URI
 				}
@@ -3802,6 +3814,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	if attemptErr == nil {
 		attemptErr = errors.New("virtual playback provider returned no usable stream")
+	}
+	if options.durablePreparation {
+		return resolvedVirtualPlaybackSource{}, attemptErr
 	}
 	// When the primary resolution fails — commonly because a previously
 	// persisted "result=" candidate has rotated or expired at the provider —
